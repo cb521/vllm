@@ -153,6 +153,8 @@ device balance because it isolates GPU work from host scheduling.
   other model dimensions should be benchmarked before widening automatic use.
 - TP1 intentionally remains native because it showed no material speedup and
   has no cross-rank communication to remove.
-- These are synthetic LM-head/logprobs benchmarks. A representative full-model
-  serving benchmark is still required to report end-to-end transformer prompt
-  throughput.
+- These are synthetic LM-head/logprobs benchmarks. Qwen3.5-27B full-model
+  Batch-1 validation is now complete; see
+  [`PROMPT_LOGPROBS_H20_PROGRESS.md`](../../PROMPT_LOGPROBS_H20_PROGRESS.md).
+  Batch 2/4 and online serving workloads remain to be measured if required by
+  the deployment configuration.
