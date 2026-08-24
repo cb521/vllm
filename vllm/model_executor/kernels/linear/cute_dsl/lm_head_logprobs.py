@@ -127,6 +127,43 @@ def _prompt_target_logits_kernel(
 
 
 @triton.jit
+def _materialized_lse_rank_kernel(
+    logits_ptr,
+    target_logits_ptr,
+    local_lse_ptr,
+    local_rank_count_ptr,
+    logits_stride,
+    valid_vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * logits_stride
+    target_logit = tl.load(target_logits_ptr + row)
+
+    running_max = float("-inf")
+    running_sum_exp = 0.0
+    rank_count = 0
+    for start in range(0, valid_vocab_size, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < valid_vocab_size
+        values = tl.load(
+            row_ptr + offsets,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        block_max = tl.max(values)
+        next_max = tl.maximum(running_max, block_max)
+        running_sum_exp = running_sum_exp * tl.exp(running_max - next_max) + tl.sum(
+            tl.exp(values - next_max)
+        )
+        running_max = next_max
+        rank_count += tl.sum(tl.where(mask & (values >= target_logit), 1, 0))
+
+    tl.store(local_lse_ptr + row, running_max + tl.log(running_sum_exp))
+    tl.store(local_rank_count_ptr + row, rank_count)
+
+
+@triton.jit
 def _merge_lse_rank_partials_kernel(
     partial_max_ptr,
     partial_sum_exp_ptr,
@@ -435,6 +472,56 @@ def prompt_target_logits(
         num_warps=num_warps,
     )
     return output
+
+
+def materialized_lse_and_rank(
+    local_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    valid_vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce materialized local logits to LSE and target-rank statistics."""
+    if local_logits.ndim != 2:
+        raise ValueError("local_logits must have shape [M, V_local]")
+    if target_logits.shape != (local_logits.shape[0],):
+        raise ValueError("target_logits must have shape [M]")
+    if local_logits.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        raise TypeError("local_logits must use float16, bfloat16, or float32")
+    if target_logits.dtype != torch.float32:
+        raise TypeError("target_logits must use float32")
+    if not local_logits.is_cuda or target_logits.device != local_logits.device:
+        raise ValueError("inputs must be CUDA tensors on the same device")
+    if local_logits.stride(-1) != 1:
+        raise ValueError("the local vocabulary dimension must be contiguous")
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError("valid_vocab_size must be in [0, V_local]")
+
+    num_rows = local_logits.shape[0]
+    local_lse = torch.empty(num_rows, dtype=torch.float32, device=local_logits.device)
+    local_rank_count = torch.empty(
+        num_rows, dtype=torch.int32, device=local_logits.device
+    )
+    if num_rows == 0:
+        return local_lse, local_rank_count
+    if valid_vocab_size == 0:
+        local_lse.fill_(-float("inf"))
+        local_rank_count.zero_()
+        return local_lse, local_rank_count
+
+    _materialized_lse_rank_kernel[(num_rows,)](
+        local_logits,
+        target_logits,
+        local_lse,
+        local_rank_count,
+        local_logits.stride(0),
+        valid_vocab_size,
+        BLOCK_SIZE=1024,
+        num_warps=8,
+    )
+    return local_lse, local_rank_count
 
 
 def validate_lm_head_logprobs_environment(lm_head_weight: torch.Tensor) -> None:
@@ -846,6 +933,7 @@ def merge_tp_prompt_logprobs(
 __all__ = [
     "LMHeadLogprobsOutput",
     "lm_head_logprobs",
+    "materialized_lse_and_rank",
     "merge_tp_prompt_logprobs",
     "prompt_target_logits",
     "validate_lm_head_logprobs_environment",

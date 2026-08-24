@@ -22,6 +22,55 @@ def _require_supported_cutedsl_device() -> None:
         pytest.skip("Requires at least 144 KiB of shared memory per block")
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_materialized_lse_and_rank_matches_torch(dtype: torch.dtype) -> None:
+    from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
+        materialized_lse_and_rank,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    logits = torch.randn(
+        (7, 2053),
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    valid_vocab_size = 2049
+    # Padding values must not affect either reduction.
+    logits[:, valid_vocab_size:] = 100
+    target_ids = torch.tensor([0, 1, 511, 1024, 1536, 2047, 2048], device="cuda")
+    target_logits = logits.gather(1, target_ids[:, None]).squeeze(1).float()
+
+    actual_lse, actual_rank = materialized_lse_and_rank(
+        logits,
+        target_logits,
+        valid_vocab_size,
+    )
+    valid_logits = logits[:, :valid_vocab_size].float()
+    expected_lse = torch.logsumexp(valid_logits, dim=1)
+    expected_rank = (valid_logits >= target_logits[:, None]).sum(
+        dim=1, dtype=torch.int32
+    )
+
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=1e-5)
+    assert torch.equal(actual_rank, expected_rank)
+
+
+def test_materialized_lse_and_rank_handles_empty_local_vocab() -> None:
+    from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
+        materialized_lse_and_rank,
+    )
+
+    local_lse, local_rank = materialized_lse_and_rank(
+        torch.empty((3, 8), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(3, device="cuda", dtype=torch.float32),
+        0,
+    )
+
+    assert torch.equal(local_lse, torch.full_like(local_lse, -float("inf")))
+    assert torch.equal(local_rank, torch.zeros_like(local_rank))
+
+
 @pytest.mark.usefixtures("_require_supported_cutedsl_device")
 @pytest.mark.parametrize("num_topk", [0, 1, 5, 20, 32])
 def test_lm_head_logprobs_matches_full_projection(num_topk: int) -> None:
@@ -469,6 +518,31 @@ def test_prompt_logprobs_warmup_compiles_cute_specializations(
     assert compiled_k == [0, 32]
 
 
+def test_materialized_prompt_logprobs_warmup_compiles_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tests.utils import ensure_current_vllm_config
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    with ensure_current_vllm_config():
+        processor = LogitsProcessor(128)
+    compiled_k = []
+
+    def record_k(*args) -> None:
+        compiled_k.append(args[-1])
+
+    monkeypatch.setattr(processor, "get_materialized_prompt_logprobs", record_k)
+    processor.warmup_materialized_prompt_logprobs(
+        SimpleNamespace(
+            weight=torch.empty((128, 64), device="cuda", dtype=torch.bfloat16)
+        )
+    )
+
+    assert compiled_k == [0, 32]
+
+
 def test_prompt_logprobs_warmup_reports_environment_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -766,6 +840,79 @@ def test_logits_processor_prompt_logprobs_tp1(num_logprobs: int) -> None:
     )
 
 
+@pytest.mark.parametrize("num_logprobs", [0, 5, 20])
+def test_materialized_prompt_logprobs_tp1(num_logprobs: int) -> None:
+    from types import SimpleNamespace
+
+    from tests.utils import ensure_current_vllm_config
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+
+    generator = torch.Generator(device="cuda").manual_seed(97)
+    num_rows, hidden_size, vocab_size = 17, 72, 1050
+    hidden_states = torch.randn(
+        (num_rows, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    weight = torch.randn(
+        (vocab_size, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    target_token_ids = torch.linspace(
+        0,
+        vocab_size - 1,
+        num_rows,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    lm_head = SimpleNamespace(
+        weight=weight,
+        bias=None,
+        quant_method=UnquantizedEmbeddingMethod(),
+        tp_size=1,
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=0,
+            org_vocab_end_index=vocab_size,
+            num_org_elements=vocab_size,
+        ),
+    )
+
+    with ensure_current_vllm_config():
+        processor = LogitsProcessor(vocab_size)
+        expected = compute_topk_scores(
+            processor(lm_head, hidden_states),
+            num_logprobs,
+            target_token_ids,
+        )
+        output_ids, output_logprobs, output_ranks = (
+            processor.get_materialized_prompt_logprobs(
+                lm_head,
+                hidden_states,
+                target_token_ids,
+                num_logprobs,
+            )
+        )
+
+    assert torch.equal(output_ids[:, 0], expected.logprob_token_ids[:, 0])
+    assert torch.equal(output_ranks.to(torch.int64), expected.selected_token_ranks)
+    # torch.topk does not promise a stable order for equal BF16 logits. The
+    # compact merge uses token ID as a deterministic tie-break, so tied IDs may
+    # be permuted while their returned logprobs remain identical.
+    torch.testing.assert_close(
+        output_logprobs,
+        expected.logprobs,
+        rtol=1e-5,
+        atol=2e-5,
+    )
+
+
 def _run_logits_processor_prompt_logprobs_tp2(
     local_rank: int,
     world_size: int,
@@ -784,6 +931,7 @@ def _run_logits_processor_prompt_logprobs_tp2(
         UnquantizedEmbeddingMethod,
     )
     from vllm.utils.system_utils import update_environment_variables
+    from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
     device = torch.device("cuda", local_rank)
     torch.accelerator.set_device_index(device)
@@ -880,6 +1028,33 @@ def _run_logits_processor_prompt_logprobs_tp2(
                     expected_logprobs,
                     rtol=2e-3,
                     atol=2e-3,
+                )
+
+                native_logits = hidden_states @ full_weight.T
+                native = compute_topk_scores(
+                    native_logits,
+                    num_logprobs,
+                    target_token_ids,
+                )
+                materialized_ids, materialized_logprobs, materialized_ranks = (
+                    processor.get_materialized_prompt_logprobs(
+                        lm_head,
+                        hidden_states,
+                        target_token_ids,
+                        num_logprobs,
+                    )
+                )
+                assert torch.equal(
+                    materialized_ids[:, 0], native.logprob_token_ids[:, 0]
+                )
+                assert torch.equal(
+                    materialized_ranks.to(torch.int64), native.selected_token_ranks
+                )
+                torch.testing.assert_close(
+                    materialized_logprobs,
+                    native.logprobs,
+                    rtol=1e-5,
+                    atol=2e-5,
                 )
     finally:
         cleanup_dist_env_and_memory()

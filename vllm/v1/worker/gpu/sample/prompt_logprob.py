@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import Literal
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -18,15 +20,17 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
 
 class CompactPromptLogprobs:
-    """Model-owned components for the compact prompt-logprobs path."""
+    """Model-owned components for an adaptive prompt-logprobs path."""
 
     def __init__(
         self,
         logits_processor: LogitsProcessor,
         lm_head: VocabParallelEmbedding,
+        backend: Literal["fused", "materialized"] = "fused",
     ) -> None:
         self._logits_processor = logits_processor
         self._lm_head = lm_head
+        self._backend = backend
 
     def compute(
         self,
@@ -34,8 +38,13 @@ class CompactPromptLogprobs:
         target_token_ids: torch.Tensor,
         num_logprobs: int,
     ) -> LogprobsTensors:
-        """Compute one prompt chunk without materializing full logits."""
-        token_ids, logprobs, ranks = self._logits_processor.get_prompt_logprobs(
+        """Compute one chunk without gathering full-vocabulary logits."""
+        compute_fn = (
+            self._logits_processor.get_materialized_prompt_logprobs
+            if self._backend == "materialized"
+            else self._logits_processor.get_prompt_logprobs
+        )
+        token_ids, logprobs, ranks = compute_fn(
             self._lm_head,
             hidden_states,
             target_token_ids,
@@ -47,9 +56,47 @@ class CompactPromptLogprobs:
             selected_token_ranks=ranks,
         )
 
+    def supports_chunk(self, num_rows: int, _num_logprobs: int) -> bool:
+        """Return whether the selected backend is faster for this chunk."""
+        if self._backend == "fused":
+            return True
+        if self._lm_head.tp_size <= 1:
+            return False
+        # H20 crossover points measured with H=5120 and V=248320. Small tail
+        # chunks retain the native path to avoid fixed collective overhead.
+        min_rows = 64 if self._lm_head.tp_size == 2 else 256
+        return num_rows >= min_rows
+
     def warmup(self) -> None:
         """Compile compact prompt-logprobs kernels."""
-        self._logits_processor.warmup_prompt_logprobs(self._lm_head)
+        if self._backend == "materialized" and self._lm_head.tp_size <= 1:
+            return
+        warmup_fn = (
+            self._logits_processor.warmup_materialized_prompt_logprobs
+            if self._backend == "materialized"
+            else self._logits_processor.warmup_prompt_logprobs
+        )
+        warmup_fn(self._lm_head)
+
+
+def _is_h20_device_name(device_name: str) -> bool:
+    """Match H20 variants without also matching H200."""
+    device_tokens = device_name.upper().replace("-", " ").replace("_", " ").split()
+    return "H20" in device_tokens
+
+
+def _select_prompt_logprobs_backend(
+    lm_head: VocabParallelEmbedding,
+) -> Literal["fused", "materialized"]:
+    """Use the platform GEMM path on H20, where it benchmarks faster."""
+    weight = getattr(lm_head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or not weight.is_cuda:
+        return "fused"
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    device_name = current_platform.get_device_name(device_index)
+    return "materialized" if _is_h20_device_name(device_name) else "fused"
 
 
 def init_compact_prompt_logprobs(
@@ -88,7 +135,8 @@ def init_compact_prompt_logprobs(
             f"VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS is unsupported by this model: {exc}"
         ) from exc
 
-    return CompactPromptLogprobs(logits_processor, lm_head)
+    backend = _select_prompt_logprobs_backend(lm_head)
+    return CompactPromptLogprobs(logits_processor, lm_head, backend)
 
 
 class PromptLogprobsWorker:
@@ -170,6 +218,9 @@ class PromptLogprobsWorker:
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
                 self._compact_prompt_logprobs.compute
+                if self._compact_prompt_logprobs is not None
+                else None,
+                self._compact_prompt_logprobs.supports_chunk
                 if self._compact_prompt_logprobs is not None
                 else None,
             )
@@ -292,6 +343,7 @@ def compute_prompt_logprobs_with_chunking(
     compact_prompt_logprobs_fn: (
         Callable[[torch.Tensor, torch.Tensor, int], LogprobsTensors] | None
     ) = None,
+    compact_prompt_logprobs_predicate: Callable[[int, int], bool] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if compact_prompt_logprobs_fn is not None:
         if logprobs_mode != "raw_logprobs":
@@ -315,7 +367,14 @@ def compute_prompt_logprobs_with_chunking(
         end_idx = start_idx + CHUNK_SIZE
         chunk_hidden_states = prompt_hidden_states[start_idx:end_idx]
         chunk_token_ids = prompt_token_ids[start_idx:end_idx]
-        if compact_prompt_logprobs_fn is not None:
+        use_compact = compact_prompt_logprobs_fn is not None and (
+            compact_prompt_logprobs_predicate is None
+            or compact_prompt_logprobs_predicate(
+                chunk_hidden_states.shape[0], num_prompt_logprobs
+            )
+        )
+        if use_compact:
+            assert compact_prompt_logprobs_fn is not None
             result = compact_prompt_logprobs_fn(
                 chunk_hidden_states,
                 chunk_token_ids,

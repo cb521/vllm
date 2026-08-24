@@ -71,6 +71,58 @@ def test_compact_prompt_logprobs_rejects_unsupported_mode() -> None:
         )
 
 
+def test_compact_prompt_logprobs_predicate_falls_back_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_rows = 1040
+    hidden_states = torch.zeros((num_rows, 2))
+    target_token_ids = torch.arange(num_rows)
+    compact_chunks = []
+    native_chunks = []
+
+    def compact_fn(
+        chunk_hidden_states: torch.Tensor,
+        chunk_token_ids: torch.Tensor,
+        _num_logprobs: int,
+    ) -> LogprobsTensors:
+        compact_chunks.append(chunk_hidden_states.shape[0])
+        return LogprobsTensors(
+            logprob_token_ids=chunk_token_ids[:, None],
+            logprobs=torch.zeros((chunk_hidden_states.shape[0], 1)),
+            selected_token_ranks=torch.ones(chunk_hidden_states.shape[0]),
+        )
+
+    def logits_fn(chunk_hidden_states: torch.Tensor) -> torch.Tensor:
+        native_chunks.append(chunk_hidden_states.shape[0])
+        return torch.zeros((chunk_hidden_states.shape[0], 8))
+
+    def fake_compute_topk_scores(
+        logits: torch.Tensor,
+        _num_logprobs: int,
+        chunk_token_ids: torch.Tensor,
+        **_kwargs,
+    ) -> LogprobsTensors:
+        return LogprobsTensors(
+            logprob_token_ids=chunk_token_ids[:, None],
+            logprobs=torch.zeros((logits.shape[0], 1)),
+            selected_token_ranks=torch.ones(logits.shape[0]),
+        )
+
+    monkeypatch.setattr(prompt_logprob, "compute_topk_scores", fake_compute_topk_scores)
+    token_ids, _, _ = prompt_logprob.compute_prompt_logprobs_with_chunking(
+        target_token_ids,
+        hidden_states,
+        logits_fn,
+        0,
+        compact_prompt_logprobs_fn=compact_fn,
+        compact_prompt_logprobs_predicate=lambda rows, _top_k: rows >= 64,
+    )
+
+    assert compact_chunks == [1024]
+    assert native_chunks == [16]
+    assert torch.equal(token_ids.squeeze(1), target_token_ids)
+
+
 @pytest.mark.parametrize(
     ("num_prompt_logprobs", "with_compact_callback"),
     [(2, False), (-1, True), (33, True)],
@@ -159,6 +211,67 @@ def test_init_compact_prompt_logprobs_resolves_model_components(
     )
     compact_prompt_logprobs.warmup()
     logits_processor.warmup_prompt_logprobs.assert_called_once_with(lm_head)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "minimum_rows"),
+    [(1, None), (2, 64), (4, 256), (8, 256)],
+)
+def test_materialized_prompt_logprobs_dispatch(
+    tp_size: int,
+    minimum_rows: int | None,
+) -> None:
+    token_ids = torch.tensor([[1]], dtype=torch.int32)
+    logprobs = torch.tensor([[-0.1]])
+    ranks = torch.tensor([1], dtype=torch.int32)
+    logits_processor = Mock()
+    logits_processor.get_materialized_prompt_logprobs.return_value = (
+        token_ids,
+        logprobs,
+        ranks,
+    )
+    lm_head = SimpleNamespace(tp_size=tp_size)
+    compact = prompt_logprob.CompactPromptLogprobs(
+        logits_processor,
+        lm_head,
+        backend="materialized",
+    )
+
+    if minimum_rows is None:
+        assert not compact.supports_chunk(1024, 20)
+        compact.warmup()
+        logits_processor.warmup_materialized_prompt_logprobs.assert_not_called()
+        return
+
+    assert not compact.supports_chunk(minimum_rows - 1, 20)
+    assert compact.supports_chunk(minimum_rows, 20)
+    hidden_states = torch.empty((minimum_rows, 4))
+    target_token_ids = torch.ones(minimum_rows, dtype=torch.int64)
+    output = compact.compute(hidden_states, target_token_ids, 20)
+    assert output.logprobs is logprobs
+    logits_processor.get_materialized_prompt_logprobs.assert_called_once_with(
+        lm_head,
+        hidden_states,
+        target_token_ids,
+        20,
+    )
+    compact.warmup()
+    logits_processor.warmup_materialized_prompt_logprobs.assert_called_once_with(
+        lm_head
+    )
+
+
+@pytest.mark.parametrize(
+    ("device_name", "expected"),
+    [
+        ("NVIDIA H20", True),
+        ("NVIDIA H20-3e", True),
+        ("NVIDIA H200", False),
+        ("NVIDIA H100 80GB HBM3", False),
+    ],
+)
+def test_is_h20_device_name(device_name: str, expected: bool) -> None:
+    assert prompt_logprob._is_h20_device_name(device_name) is expected
 
 
 def test_kernel_warmup_delegates_to_compact_prompt_logprobs() -> None:

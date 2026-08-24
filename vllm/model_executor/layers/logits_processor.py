@@ -311,7 +311,6 @@ class LogitsProcessor(PluggableLayer):
 
         from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
             lm_head_logprobs,
-            merge_tp_prompt_logprobs,
             prompt_target_logits,
         )
 
@@ -346,12 +345,148 @@ class LogitsProcessor(PluggableLayer):
             valid_vocab_size=shard_indices.num_org_elements,
             global_vocab_start=vocab_start,
         )
-        if hidden_states.shape[0] == 0:
+        return self._merge_local_prompt_logprobs(
+            lm_head,
+            local_output.topk_values,
+            local_output.topk_ids,
+            local_output.lse,
+            local_output.rank_count,
+            target_token_ids,
+            target_logits,
+            num_logprobs,
+        )
+
+    def get_materialized_prompt_logprobs(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        num_logprobs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute prompt logprobs from materialized TP-local logits.
+
+        Unlike the native path, this method never gathers the full vocabulary.
+        Unlike the fused CuTe path, it lets the platform GEMM implementation
+        produce each rank's local logits before reducing them to compact state.
+        This tradeoff is substantially faster on H20 for large prompt chunks,
+        while still avoiding global logits and FP32 logprobs tensors.
+        """
+        if not 0 <= num_logprobs <= 32:
+            raise ValueError("num_logprobs must be in [0, 32]")
+
+        from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
+            materialized_lse_and_rank,
+        )
+
+        hidden_states = hidden_states.contiguous()
+        target_token_ids = target_token_ids.contiguous()
+        local_logits = self._apply_head(
+            lm_head,
+            hidden_states,
+            getattr(lm_head, "bias", None),
+        ).contiguous()
+        if self.soft_cap is not None:
+            local_logits = torch.tanh(local_logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            local_logits = local_logits * self.scale
+
+        shard_indices = lm_head.shard_indices
+        vocab_start = shard_indices.org_vocab_start_index
+        vocab_end = shard_indices.org_vocab_end_index
+        valid_vocab_size = shard_indices.num_org_elements
+        target_is_local = (target_token_ids >= vocab_start) & (
+            target_token_ids < vocab_end
+        )
+        local_target_ids = torch.where(
+            target_is_local,
+            target_token_ids - vocab_start,
+            0,
+        ).to(torch.int64)
+        target_logits = (
+            local_logits.gather(1, local_target_ids[:, None]).squeeze(1).float()
+        )
+        target_logits = torch.where(target_is_local, target_logits, 0.0)
+        if lm_head.tp_size > 1 and hidden_states.shape[0] > 0:
+            target_logits = tensor_model_parallel_all_reduce(target_logits)
+
+        local_lse, local_rank_count = materialized_lse_and_rank(
+            local_logits,
+            target_logits,
+            valid_vocab_size,
+        )
+        if num_logprobs == 0:
+            local_topk_values = torch.empty(
+                (hidden_states.shape[0], 0),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            local_topk_ids = torch.empty(
+                (hidden_states.shape[0], 0),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+        else:
+            local_k = min(num_logprobs, valid_vocab_size)
+            if local_k == 0:
+                local_topk_values = torch.empty(
+                    (hidden_states.shape[0], 0),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                local_topk_ids = torch.empty(
+                    (hidden_states.shape[0], 0),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+            else:
+                local_topk_values, local_topk_ids = _topk(
+                    local_logits[:, :valid_vocab_size], local_k
+                )
+                local_topk_values = local_topk_values.float()
+                local_topk_ids = local_topk_ids.to(torch.int32) + vocab_start
+            if local_k < num_logprobs:
+                pad_width = num_logprobs - local_k
+                local_topk_values = F.pad(
+                    local_topk_values,
+                    (0, pad_width),
+                    value=-float("inf"),
+                )
+                local_topk_ids = F.pad(local_topk_ids, (0, pad_width), value=-1)
+
+        return self._merge_local_prompt_logprobs(
+            lm_head,
+            local_topk_values,
+            local_topk_ids,
+            local_lse,
+            local_rank_count,
+            target_token_ids,
+            target_logits,
+            num_logprobs,
+        )
+
+    def _merge_local_prompt_logprobs(
+        self,
+        lm_head: VocabParallelEmbedding,
+        local_topk_values: torch.Tensor,
+        local_topk_ids: torch.Tensor,
+        local_lse: torch.Tensor,
+        local_rank_count: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_logits: torch.Tensor,
+        num_logprobs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather compact TP-local state and produce global results."""
+        from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
+            merge_tp_prompt_logprobs,
+        )
+
+        num_rows = target_token_ids.shape[0]
+        if num_rows == 0:
             return merge_tp_prompt_logprobs(
-                local_output.topk_values.unsqueeze(0),
-                local_output.topk_ids.unsqueeze(0),
-                local_output.lse.unsqueeze(0),
-                local_output.rank_count.unsqueeze(0),
+                local_topk_values.unsqueeze(0),
+                local_topk_ids.unsqueeze(0),
+                local_lse.unsqueeze(0),
+                local_rank_count.unsqueeze(0),
                 target_token_ids,
                 target_logits,
                 num_logprobs,
@@ -361,10 +496,10 @@ class LogitsProcessor(PluggableLayer):
         # can use one homogeneous all-gather without losing integer precision.
         compact = torch.cat(
             (
-                local_output.topk_values,
-                local_output.topk_ids.view(torch.float32),
-                local_output.lse[:, None],
-                local_output.rank_count.view(torch.float32)[:, None],
+                local_topk_values,
+                local_topk_ids.view(torch.float32),
+                local_lse[:, None],
+                local_rank_count.view(torch.float32)[:, None],
             ),
             dim=-1,
         )
@@ -372,9 +507,7 @@ class LogitsProcessor(PluggableLayer):
             compact = tensor_model_parallel_all_gather(compact, dim=0)
 
         compact_width = 2 * num_logprobs + 2
-        tp_compact = compact.view(
-            lm_head.tp_size, hidden_states.shape[0], compact_width
-        )
+        tp_compact = compact.view(lm_head.tp_size, num_rows, compact_width)
         tp_topk_values = tp_compact[..., :num_logprobs]
         tp_topk_ids = tp_compact[..., num_logprobs : 2 * num_logprobs].view(torch.int32)
         tp_local_lse = tp_compact[..., -2]
@@ -476,7 +609,45 @@ class LogitsProcessor(PluggableLayer):
                         num_logprobs,
                     )
                 torch.accelerator.synchronize(lm_head.weight.device)
-        except (TypeError, ValueError, RuntimeError) as exc:
+        except (ImportError, TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS failed during startup "
+                "kernel compilation"
+            ) from exc
+
+    def warmup_materialized_prompt_logprobs(
+        self, lm_head: VocabParallelEmbedding
+    ) -> None:
+        """Compile the TP-local materialized prompt-logprobs path."""
+        weight = lm_head.weight
+        if not weight.is_cuda:
+            raise RuntimeError("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS requires CUDA")
+        if not weight.is_contiguous():
+            raise ValueError("the LM-head weight must be contiguous")
+        if weight.shape[0] == 0:
+            raise ValueError("the local vocabulary must not be empty")
+
+        hidden_states = torch.zeros(
+            (1, weight.shape[1]),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        target_token_ids = torch.zeros(
+            1,
+            dtype=torch.int64,
+            device=weight.device,
+        )
+        try:
+            with torch.inference_mode():
+                for num_logprobs in (0, 32):
+                    self.get_materialized_prompt_logprobs(
+                        lm_head,
+                        hidden_states,
+                        target_token_ids,
+                        num_logprobs,
+                    )
+                torch.accelerator.synchronize(weight.device)
+        except (ImportError, TypeError, ValueError, RuntimeError) as exc:
             raise RuntimeError(
                 "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS failed during startup "
                 "kernel compilation"
