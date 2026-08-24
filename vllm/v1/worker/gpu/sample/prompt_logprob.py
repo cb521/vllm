@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config.model import LogprobsMode
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -89,6 +90,9 @@ def _select_prompt_logprobs_backend(
     lm_head: VocabParallelEmbedding,
 ) -> Literal["fused", "materialized"]:
     """Use the platform GEMM path on H20, where it benchmarks faster."""
+    configured_backend = envs.VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND
+    if configured_backend != "auto":
+        return configured_backend
     weight = getattr(lm_head, "weight", None)
     if not isinstance(weight, torch.Tensor) or not weight.is_cuda:
         return "fused"

@@ -84,6 +84,42 @@ def test_v2_compact_prompt_logprobs_is_not_compile_factor(
     assert optimized_factors == baseline_factors
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        ("fused", "fused"),
+        ("materialized", "materialized"),
+    ],
+)
+def test_v2_compact_prompt_logprobs_backend_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: str,
+) -> None:
+    name = "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert expected == envs.VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND
+
+
+def test_v2_compact_prompt_logprobs_backend_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND"
+    monkeypatch.setenv(name, "auto")
+    auto_factors = envs.compile_factors()
+    monkeypatch.setenv(name, "fused")
+    fused_factors = envs.compile_factors()
+
+    assert name not in fused_factors
+    assert fused_factors == auto_factors
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")

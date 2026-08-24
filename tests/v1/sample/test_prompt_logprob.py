@@ -274,6 +274,18 @@ def test_is_h20_device_name(device_name: str, expected: bool) -> None:
     assert prompt_logprob._is_h20_device_name(device_name) is expected
 
 
+@pytest.mark.parametrize("backend", ["fused", "materialized"])
+def test_prompt_logprobs_backend_override(
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND", backend)
+
+    selected = prompt_logprob._select_prompt_logprobs_backend(SimpleNamespace())
+
+    assert selected == backend
+
+
 def test_kernel_warmup_delegates_to_compact_prompt_logprobs() -> None:
     compact_prompt_logprobs = Mock()
     worker = SimpleNamespace(

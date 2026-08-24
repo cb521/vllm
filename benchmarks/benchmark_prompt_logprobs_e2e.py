@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark prompt logprobs with a real model, end to end.
 
-The compact prompt-logprobs switch is read when vLLM workers start, so the
-baseline and optimized variants run in separate subprocesses. Each worker
-loads the model once, measures every requested case, and writes compact NumPy
-artifacts for numerical comparison.
+The prompt-logprobs backend is selected when vLLM workers start, so the native,
+fused, and H20 variants run in separate subprocesses. Each worker loads the
+model once, measures every requested case, and writes compact NumPy artifacts
+for numerical comparison.
 
 For example, on one eight-GPU node::
 
@@ -14,6 +14,7 @@ For example, on one eight-GPU node::
         --tensor-parallel-size 2 \
         --prompt-lengths 1024 4096 8192 16384 32768 \
         --batch-sizes 1 --top-k 0 20 \
+        --variants native fused h20 \
         --output-dir /tmp/prompt-logprobs-tp2
 
 Use ``--profile-case 32768,1,20`` together with Nsight Systems and
@@ -38,10 +39,27 @@ from typing import Any
 import numpy as np
 
 _COMPACT_ENV = "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS"
+_BACKEND_ENV = "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND"
 _MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 _GIB = 1024**3
 _MIB = 1024**2
 _SCORE_ATOL = 2e-5
+
+
+@dataclass(frozen=True)
+class Variant:
+    compact_enabled: bool
+    backend: str
+
+
+_VARIANTS = {
+    "native": Variant(False, "auto"),
+    "fused": Variant(True, "fused"),
+    "h20": Variant(True, "materialized"),
+    # Backward-compatible names used by the original two-way benchmark.
+    "baseline": Variant(False, "auto"),
+    "optimized": Variant(True, "auto"),
+}
 
 
 @dataclass(frozen=True)
@@ -110,14 +128,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variants",
         nargs="+",
-        choices=("baseline", "optimized"),
-        default=("baseline", "optimized"),
+        choices=tuple(_VARIANTS),
+        default=("native", "fused", "h20"),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--worker-variant",
-        choices=("baseline", "optimized"),
+        choices=tuple(_VARIANTS),
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
@@ -137,6 +155,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num-warmups must be non-negative")
     if any(not 0 <= value <= 32 for value in args.top_k):
         parser.error("--top-k values must be between 0 and 32")
+    if len(set(args.variants)) != len(args.variants):
+        parser.error("--variants must not contain duplicates")
     if args.kv_cache_memory_gib < 0:
         parser.error("--kv-cache-memory-gib must be non-negative")
     if args.memory_sample_interval <= 0:
@@ -461,11 +481,18 @@ def model_dimensions(model_config: Any) -> dict[str, Any]:
 
 def run_worker(args: argparse.Namespace) -> None:
     os.environ[_MODEL_RUNNER_ENV] = "1"
-    expected_enabled = args.worker_variant == "optimized"
+    variant = _VARIANTS[args.worker_variant]
+    expected_enabled = variant.compact_enabled
     actual_enabled = bool(int(os.environ.get(_COMPACT_ENV, "0")))
     if actual_enabled != expected_enabled:
         raise RuntimeError(
             f"{_COMPACT_ENV}={int(actual_enabled)} does not match worker variant "
+            f"{args.worker_variant!r}"
+        )
+    actual_backend = os.environ.get(_BACKEND_ENV, "auto")
+    if actual_backend != variant.backend:
+        raise RuntimeError(
+            f"{_BACKEND_ENV}={actual_backend!r} does not match worker variant "
             f"{args.worker_variant!r}"
         )
 
@@ -528,6 +555,7 @@ def run_worker(args: argparse.Namespace) -> None:
     output = {
         "variant": args.worker_variant,
         "compact_prompt_logprobs": actual_enabled,
+        "compact_prompt_logprobs_backend": actual_backend,
         "model_runner_v2": True,
         "git_revision": git_revision(),
         "vllm_version": vllm.__version__,
@@ -677,9 +705,13 @@ def compare_artifacts(baseline: Any, optimized: Any) -> dict[str, Any]:
     }
 
 
-def compare_variants(output_dir: Path) -> dict[str, Any]:
-    baseline = json.loads((output_dir / "baseline.json").read_text())
-    optimized = json.loads((output_dir / "optimized.json").read_text())
+def compare_variant_pair(
+    output_dir: Path,
+    reference_variant: str,
+    candidate_variant: str,
+) -> dict[str, Any]:
+    reference = json.loads((output_dir / f"{reference_variant}.json").read_text())
+    candidate = json.loads((output_dir / f"{candidate_variant}.json").read_text())
     comparable_fields = (
         "git_revision",
         "model",
@@ -695,83 +727,101 @@ def compare_variants(output_dir: Path) -> dict[str, Any]:
         "num_repeats",
     )
     for field in comparable_fields:
-        if baseline[field] != optimized[field]:
-            raise RuntimeError(f"baseline and optimized {field} differ")
-    baseline_cases = {case["name"]: case for case in baseline["cases"]}
-    optimized_cases = {case["name"]: case for case in optimized["cases"]}
-    if baseline_cases.keys() != optimized_cases.keys():
-        raise RuntimeError("baseline and optimized case matrices differ")
+        if reference[field] != candidate[field]:
+            raise RuntimeError(
+                f"{reference_variant} and {candidate_variant} {field} differ"
+            )
+    reference_cases = {case["name"]: case for case in reference["cases"]}
+    candidate_cases = {case["name"]: case for case in candidate["cases"]}
+    if reference_cases.keys() != candidate_cases.keys():
+        raise RuntimeError(
+            f"{reference_variant} and {candidate_variant} case matrices differ"
+        )
 
     comparisons = []
-    for name, baseline_case in baseline_cases.items():
-        optimized_case = optimized_cases[name]
+    for name, reference_case in reference_cases.items():
+        candidate_case = candidate_cases[name]
         with (
-            load_artifact(output_dir / "baseline", baseline_case) as baseline_data,
-            load_artifact(output_dir / "optimized", optimized_case) as optimized_data,
+            load_artifact(
+                output_dir / reference_variant, reference_case
+            ) as reference_data,
+            load_artifact(
+                output_dir / candidate_variant, candidate_case
+            ) as candidate_data,
         ):
-            correctness = compare_artifacts(baseline_data, optimized_data)
-        baseline_latency = baseline_case["median_elapsed_seconds"]
-        optimized_latency = optimized_case["median_elapsed_seconds"]
-        baseline_ttft = baseline_case["median_first_token_latency_seconds"]
-        optimized_ttft = optimized_case["median_first_token_latency_seconds"]
+            correctness = compare_artifacts(reference_data, candidate_data)
+        reference_latency = reference_case["median_elapsed_seconds"]
+        candidate_latency = candidate_case["median_elapsed_seconds"]
+        reference_ttft = reference_case["median_first_token_latency_seconds"]
+        candidate_ttft = candidate_case["median_first_token_latency_seconds"]
         total_prompt_tokens = (
-            baseline_case["prompt_length"] * baseline_case["batch_size"]
+            reference_case["prompt_length"] * reference_case["batch_size"]
         )
-        baseline_peak = baseline_case["max_peak_used_mib_per_gpu"]
-        optimized_peak = optimized_case["max_peak_used_mib_per_gpu"]
+        reference_peak = reference_case["max_peak_used_mib_per_gpu"]
+        candidate_peak = candidate_case["max_peak_used_mib_per_gpu"]
         comparisons.append(
             {
                 "name": name,
-                "prompt_length": baseline_case["prompt_length"],
-                "batch_size": baseline_case["batch_size"],
-                "top_k": baseline_case["top_k"],
-                "baseline_median_ms": baseline_latency * 1000,
-                "optimized_median_ms": optimized_latency * 1000,
-                "speedup": baseline_latency / optimized_latency,
-                "baseline_prompt_tokens_per_second": baseline_case[
+                "prompt_length": reference_case["prompt_length"],
+                "batch_size": reference_case["batch_size"],
+                "top_k": reference_case["top_k"],
+                "reference_median_ms": reference_latency * 1000,
+                "candidate_median_ms": candidate_latency * 1000,
+                "speedup": reference_latency / candidate_latency,
+                "reference_prompt_tokens_per_second": reference_case[
                     "prompt_tokens_per_second"
                 ],
-                "optimized_prompt_tokens_per_second": optimized_case[
+                "candidate_prompt_tokens_per_second": candidate_case[
                     "prompt_tokens_per_second"
                 ],
-                "baseline_median_ttft_ms": baseline_ttft * 1000,
-                "optimized_median_ttft_ms": optimized_ttft * 1000,
-                "ttft_speedup": baseline_ttft / optimized_ttft,
-                "baseline_engine_prompt_tokens_per_second": (
-                    total_prompt_tokens / baseline_ttft
+                "reference_median_ttft_ms": reference_ttft * 1000,
+                "candidate_median_ttft_ms": candidate_ttft * 1000,
+                "ttft_speedup": reference_ttft / candidate_ttft,
+                "reference_engine_prompt_tokens_per_second": (
+                    total_prompt_tokens / reference_ttft
                 ),
-                "optimized_engine_prompt_tokens_per_second": (
-                    total_prompt_tokens / optimized_ttft
+                "candidate_engine_prompt_tokens_per_second": (
+                    total_prompt_tokens / candidate_ttft
                 ),
-                "baseline_frontend_output_ms": (baseline_latency - baseline_ttft)
+                "reference_frontend_output_ms": (reference_latency - reference_ttft)
                 * 1000,
-                "optimized_frontend_output_ms": (optimized_latency - optimized_ttft)
+                "candidate_frontend_output_ms": (candidate_latency - candidate_ttft)
                 * 1000,
-                "baseline_peak_used_mib_per_gpu": baseline_peak,
-                "optimized_peak_used_mib_per_gpu": optimized_peak,
+                "reference_peak_used_mib_per_gpu": reference_peak,
+                "candidate_peak_used_mib_per_gpu": candidate_peak,
                 "peak_used_memory_reduction_percent": (
-                    (baseline_peak - optimized_peak) / baseline_peak * 100
+                    (reference_peak - candidate_peak) / reference_peak * 100
                 ),
                 **correctness,
             }
         )
 
-    comparison = {
-        "git_revision": baseline["git_revision"],
-        "model": baseline["model"],
-        "model_revision": baseline["model_revision"],
-        "model_dimensions": baseline["model_dimensions"],
-        "tensor_parallel_size": baseline["tensor_parallel_size"],
+    return {
+        "reference_variant": reference_variant,
+        "candidate_variant": candidate_variant,
+        "git_revision": reference["git_revision"],
+        "model": reference["model"],
+        "model_revision": reference["model_revision"],
+        "model_dimensions": reference["model_dimensions"],
+        "tensor_parallel_size": reference["tensor_parallel_size"],
         "cases": comparisons,
     }
+
+
+def compare_variants(output_dir: Path) -> dict[str, Any]:
+    """Preserve the original baseline/optimized comparison API."""
+    comparison = compare_variant_pair(output_dir, "baseline", "optimized")
     (output_dir / "comparison.json").write_text(json.dumps(comparison, indent=2) + "\n")
     return comparison
 
 
 def print_comparison(comparison: dict[str, Any]) -> None:
+    reference_variant = comparison["reference_variant"]
+    candidate_variant = comparison["candidate_variant"]
     print()
     print(
-        "| Prompt | Batch | K | Baseline (ms) | Optimized (ms) | "
+        f"| Prompt | Batch | K | {reference_variant} (ms) | "
+        f"{candidate_variant} (ms) | "
         "Speedup | TTFT speedup | Rank exact | Equivalent | Max target error |"
     )
     print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: | ---: |")
@@ -780,8 +830,8 @@ def print_comparison(comparison: dict[str, Any]) -> None:
         equivalent = "yes" if case["outputs_semantically_equivalent"] else "no"
         print(
             f"| {case['prompt_length']} | {case['batch_size']} | "
-            f"{case['top_k']} | {case['baseline_median_ms']:.2f} | "
-            f"{case['optimized_median_ms']:.2f} | {case['speedup']:.3f}x | "
+            f"{case['top_k']} | {case['reference_median_ms']:.2f} | "
+            f"{case['candidate_median_ms']:.2f} | {case['speedup']:.3f}x | "
             f"{case['ttft_speedup']:.3f}x | {rank_match} | {equivalent} | "
             f"{case['target_max_abs_error']:.3e} |"
         )
@@ -799,6 +849,7 @@ def run_parent(args: argparse.Namespace) -> None:
         )
 
     for variant in args.variants:
+        settings = _VARIANTS[variant]
         command = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -808,21 +859,48 @@ def run_parent(args: argparse.Namespace) -> None:
         ]
         environment = os.environ.copy()
         environment[_MODEL_RUNNER_ENV] = "1"
-        environment[_COMPACT_ENV] = "1" if variant == "optimized" else "0"
+        environment[_COMPACT_ENV] = "1" if settings.compact_enabled else "0"
+        environment[_BACKEND_ENV] = settings.backend
         subprocess.run(command, check=True, env=environment)
 
-    if set(args.variants) == {"baseline", "optimized"}:
-        comparison = compare_variants(args.output_dir)
-        print_comparison(comparison)
+    comparisons = []
+    for index, reference_variant in enumerate(args.variants):
+        for candidate_variant in args.variants[index + 1 :]:
+            comparison = compare_variant_pair(
+                args.output_dir,
+                reference_variant,
+                candidate_variant,
+            )
+            name = f"comparison-{reference_variant}-vs-{candidate_variant}.json"
+            (args.output_dir / name).write_text(json.dumps(comparison, indent=2) + "\n")
+            comparisons.append(comparison)
+            print_comparison(comparison)
+
+    if comparisons:
+        aggregate = {
+            "variants": list(args.variants),
+            "comparisons": comparisons,
+        }
+        (args.output_dir / "comparison.json").write_text(
+            json.dumps(aggregate, indent=2) + "\n"
+        )
         mismatches = [
-            case["name"]
+            (
+                comparison["reference_variant"],
+                comparison["candidate_variant"],
+                case["name"],
+            )
+            for comparison in comparisons
             for case in comparison["cases"]
             if not case["outputs_semantically_equivalent"]
         ]
         if mismatches and not args.allow_correctness_mismatch:
-            formatted_cases = ", ".join(mismatches)
+            formatted_cases = ", ".join(
+                f"{reference} vs {candidate}: {case}"
+                for reference, candidate, case in mismatches
+            )
             raise RuntimeError(
-                "baseline and optimized outputs are not semantically equivalent for: "
+                "variant outputs are not semantically equivalent for: "
                 f"{formatted_cases}"
             )
 
