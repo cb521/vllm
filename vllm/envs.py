@@ -2275,6 +2275,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        # Selects the post-forward prompt-logprobs worker and does not affect
+        # the compiled model graph. Keeping it in the key needlessly compiles
+        # a second backbone for baseline/optimized comparisons.
+        "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

@@ -72,6 +72,18 @@ def test_v2_compact_prompt_logprobs_env(
     assert envs.VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS is expected
 
 
+def test_v2_compact_prompt_logprobs_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", raising=False)
+    baseline_factors = envs.compile_factors()
+    monkeypatch.setenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", "1")
+    optimized_factors = envs.compile_factors()
+
+    assert "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS" not in optimized_factors
+    assert optimized_factors == baseline_factors
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")
