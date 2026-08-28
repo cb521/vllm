@@ -328,6 +328,9 @@ class LogitsProcessor(PluggableLayer):
             -1,
         )
 
+        # Every CuTe specialization exposes the BF16 LM-head output contract,
+        # so target logits must follow the same platform GEMM accumulation and
+        # output rounding before their TP reduction.
         target_logits = prompt_target_logits(
             hidden_states,
             lm_head.weight,

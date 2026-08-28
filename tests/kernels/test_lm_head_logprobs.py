@@ -72,20 +72,32 @@ def test_materialized_lse_and_rank_handles_empty_local_vocab() -> None:
 
 
 @pytest.mark.usefixtures("_require_supported_cutedsl_device")
+@pytest.mark.parametrize("hidden_size", [72, 128, 136])
 @pytest.mark.parametrize("num_topk", [0, 1, 5, 20, 32])
-def test_lm_head_logprobs_matches_full_projection(num_topk: int) -> None:
+def test_lm_head_logprobs_matches_full_projection(
+    num_topk: int,
+    hidden_size: int,
+) -> None:
     from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
         lm_head_logprobs,
     )
 
     generator = torch.Generator(device="cuda").manual_seed(34)
     hidden_states = (
-        torch.randn((17, 72), device="cuda", dtype=torch.bfloat16, generator=generator)
+        torch.randn(
+            (17, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
         * 0.01
     )
     lm_head_weight = (
         torch.randn(
-            (1051, 72), device="cuda", dtype=torch.bfloat16, generator=generator
+            (1051, hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
         )
         * 0.01
     )
@@ -108,14 +120,21 @@ def test_lm_head_logprobs_matches_full_projection(num_topk: int) -> None:
         global_vocab_start=global_vocab_start,
     )
 
-    logits = hidden_states.float() @ lm_head_weight[:valid_vocab_size].float().T
+    logits = (
+        (hidden_states.float() @ lm_head_weight[:valid_vocab_size].float().T)
+        .to(torch.bfloat16)
+        .float()
+    )
+    reference_target_logits = target_logits.to(torch.bfloat16).float()
     local_target_mask = local_target_ids >= 0
     rows = torch.arange(hidden_states.shape[0], device="cuda")[local_target_mask]
-    logits[rows, local_target_ids[local_target_mask].long()] = target_logits[
+    logits[rows, local_target_ids[local_target_mask].long()] = reference_target_logits[
         local_target_mask
     ]
     expected_lse = torch.logsumexp(logits, dim=-1)
-    expected_rank = (logits >= target_logits[:, None]).sum(dim=-1).to(torch.int32)
+    expected_rank = (
+        (logits >= reference_target_logits[:, None]).sum(dim=-1).to(torch.int32)
+    )
 
     assert torch.equal(output.rank_count, expected_rank)
     assert torch.allclose(output.lse, expected_lse, rtol=2e-3, atol=2e-3)
@@ -124,10 +143,17 @@ def test_lm_head_logprobs_matches_full_projection(num_topk: int) -> None:
         assert output.topk_ids.shape == (17, 0)
         return
 
-    expected_values, expected_ids = torch.topk(logits, num_topk, dim=-1)
-    expected_ids = expected_ids.to(torch.int32) + global_vocab_start
-    assert torch.equal(output.topk_ids, expected_ids)
+    expected_values = torch.topk(logits, num_topk, dim=-1).values
     assert torch.allclose(output.topk_values, expected_values, rtol=2e-3, atol=2e-3)
+    # BF16 creates exact ties. Token order inside a tied score is not part of
+    # torch.topk's contract, so validate IDs against their scores and the
+    # returned score multiset instead of requiring one tie order.
+    actual_local_ids = output.topk_ids.to(torch.int64) - global_vocab_start
+    assert torch.all((actual_local_ids >= 0) & (actual_local_ids < valid_vocab_size))
+    actual_id_scores = logits.gather(1, actual_local_ids)
+    assert torch.equal(actual_id_scores, output.topk_values)
+    sorted_ids = torch.sort(actual_local_ids, dim=1).values
+    assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
 
 
 @pytest.mark.usefixtures("_require_supported_cutedsl_device")
@@ -301,127 +327,62 @@ def test_merge_tp_prompt_logprobs_orders_cross_rank_ties() -> None:
     assert output_ranks.item() == 6
 
 
-def _prompt_target_logits_reference(
-    hidden_states: torch.Tensor,
-    lm_head_weight: torch.Tensor,
-    local_target_ids: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    output = torch.zeros(
-        hidden_states.shape[0],
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    is_local = (local_target_ids >= 0) & (local_target_ids < lm_head_weight.shape[0])
-    if not torch.any(is_local):
-        return output
-
-    target_ids = local_target_ids[is_local].to(torch.int64)
-    output[is_local] = (
-        hidden_states[is_local].float()
-        * lm_head_weight.index_select(0, target_ids).float()
-    ).sum(dim=-1)
-    if bias is not None:
-        output[is_local] += bias.index_select(0, target_ids).float()
-    return output
-
-
-def test_prompt_target_logits_non_local_targets_contribute_zero() -> None:
-    from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
-        prompt_target_logits,
-    )
-
-    generator = torch.Generator(device="cuda").manual_seed(0)
-    hidden_states = torch.randn(
-        (7, 497),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    lm_head_weight = torch.randn(
-        (19, 497),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    bias = torch.randn(
-        19,
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    local_target_ids = torch.tensor(
-        [0, 18, -1, 19, 7, 3, 12],
-        device="cuda",
-        dtype=torch.int64,
-    )
-
-    actual = prompt_target_logits(
-        hidden_states,
-        lm_head_weight,
-        local_target_ids,
-        bias,
-    )
-    expected = _prompt_target_logits_reference(
-        hidden_states,
-        lm_head_weight,
-        local_target_ids,
-        bias,
-    )
-
-    assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
-    assert actual[2].item() == 0.0
-    assert actual[3].item() == 0.0
-
-
-@pytest.mark.parametrize(
-    ("dtype", "tolerance"),
-    [
-        pytest.param(torch.float16, 2e-3, id="fp16"),
-        pytest.param(torch.bfloat16, 2e-2, id="bf16"),
-    ],
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="The batched target GEMM requires BF16 tensor cores",
 )
-def test_prompt_target_logits_fp32_accumulation(
-    dtype: torch.dtype,
-    tolerance: float,
+@pytest.mark.parametrize("num_rows", [1, 17, 128, 129, 512, 513, 1024])
+def test_prompt_target_logits_matches_platform_projection(
+    num_rows: int,
 ) -> None:
     from vllm.model_executor.kernels.linear.cute_dsl.lm_head_logprobs import (
         prompt_target_logits,
     )
 
-    generator = torch.Generator(device="cuda").manual_seed(1)
-    hidden_states = torch.randn(
-        (11, 4097),
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
+    generator = torch.Generator(device="cuda").manual_seed(79 + num_rows)
+    hidden_states = (
+        torch.randn(
+            (num_rows, 136),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.01
     )
-    lm_head_weight = torch.randn(
-        (23, 4097),
-        device="cuda",
-        dtype=dtype,
-        generator=generator,
+    lm_head_weight = (
+        torch.randn(
+            (1051, 136),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.01
     )
-    local_target_ids = torch.arange(11, device="cuda", dtype=torch.int32)
+    local_target_ids = (
+        torch.arange(num_rows, device="cuda", dtype=torch.int64) * 37 + 11
+    ) % lm_head_weight.shape[0]
+    local_target_ids[0] = -1
+    if num_rows > 1:
+        local_target_ids[1] = lm_head_weight.shape[0]
 
     actual = prompt_target_logits(
         hidden_states,
         lm_head_weight,
         local_target_ids,
     )
-    expected = _prompt_target_logits_reference(
-        hidden_states,
-        lm_head_weight,
-        local_target_ids,
+    is_local = (local_target_ids >= 0) & (local_target_ids < lm_head_weight.shape[0])
+    safe_target_ids = torch.where(is_local, local_target_ids, 0)
+    expected = (
+        torch.nn.functional.linear(hidden_states, lm_head_weight)
+        .gather(1, safe_target_ids[:, None])
+        .squeeze(1)
+        .float()
     )
+    expected = torch.where(is_local, expected, 0.0)
 
-    torch.testing.assert_close(
-        actual,
-        expected,
-        rtol=tolerance,
-        atol=tolerance,
-    )
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-5)
+    assert torch.equal(actual[~is_local], torch.zeros_like(actual[~is_local]))
 
 
 def test_prompt_target_logits_shard_sum_recovers_global_logits() -> None:
@@ -431,22 +392,10 @@ def test_prompt_target_logits_shard_sum_recovers_global_logits() -> None:
 
     generator = torch.Generator(device="cuda").manual_seed(2)
     hidden_states = torch.randn(
-        (6, 513),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
+        (6, 136), device="cuda", dtype=torch.bfloat16, generator=generator
     )
     full_weight = torch.randn(
-        (20, 513),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    full_bias = torch.randn(
-        20,
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
+        (20, 136), device="cuda", dtype=torch.bfloat16, generator=generator
     )
     global_target_ids = torch.tensor(
         [0, 9, 10, 11, 18, 19],
@@ -464,25 +413,14 @@ def test_prompt_target_logits_shard_sum_recovers_global_logits() -> None:
         hidden_states,
         full_weight[:10],
         rank_0_ids,
-        full_bias[:10],
     )
     rank_1_logits = prompt_target_logits(
         hidden_states,
         full_weight[10:],
         rank_1_ids,
-        full_bias[10:],
     )
-
-    expected = (
-        hidden_states.float() * full_weight.index_select(0, global_target_ids).float()
-    ).sum(dim=-1)
-    expected += full_bias.index_select(0, global_target_ids).float()
-    torch.testing.assert_close(
-        rank_0_logits + rank_1_logits,
-        expected,
-        rtol=1e-5,
-        atol=1e-4,
-    )
+    expected = prompt_target_logits(hidden_states, full_weight, global_target_ids)
+    assert torch.equal(rank_0_logits + rank_1_logits, expected)
 
 
 def test_prompt_logprobs_warmup_compiles_cute_specializations(
@@ -732,7 +670,10 @@ def test_validate_lm_head_logprobs_environment_rejects_insufficient_smem(
     from types import SimpleNamespace
 
     pytest.importorskip("cutlass")
-    from vllm.model_executor.kernels.linear.cute_dsl import lm_head_logprobs
+    from vllm.model_executor.kernels.linear.cute_dsl import (
+        _lm_head_logprobs_mainloop,
+        lm_head_logprobs,
+    )
 
     capability = SimpleNamespace(major=8, to_int=lambda: 80)
     monkeypatch.setattr(
@@ -741,7 +682,7 @@ def test_validate_lm_head_logprobs_environment_rejects_insufficient_smem(
         lambda _device_index: capability,
     )
     monkeypatch.setattr(
-        lm_head_logprobs,
+        _lm_head_logprobs_mainloop,
         "cuda_get_device_properties",
         lambda *_args, **_kwargs: (128 * 1024,),
     )
@@ -754,7 +695,7 @@ def test_validate_lm_head_logprobs_environment_rejects_insufficient_smem(
 @pytest.mark.parametrize("num_logprobs", [0, 5, 20])
 @pytest.mark.usefixtures("_require_supported_cutedsl_device")
 def test_logits_processor_prompt_logprobs_tp1(num_logprobs: int) -> None:
-    """Validate the compact FP32-accumulator prompt-logprobs contract."""
+    """Validate the compact native-BF16 prompt-logprobs contract."""
     from types import SimpleNamespace
 
     from tests.utils import ensure_current_vllm_config
@@ -815,9 +756,9 @@ def test_logits_processor_prompt_logprobs_tp1(num_logprobs: int) -> None:
             num_logprobs,
         )
 
-    # Compact prompt logprobs intentionally keep FP32 accumulation through
-    # top-K, LSE, and rank computation; this is its numerical reference.
-    logits = hidden_states.float() @ lm_head_weight.float().T
+    # Tensor-core accumulation is FP32, but native LM-head logits are exposed
+    # as BF16 before top-K, LSE, and rank computation.
+    logits = torch.nn.functional.linear(hidden_states, lm_head_weight).float()
     target_logits = logits.gather(1, target_token_ids[:, None]).squeeze(1)
     lse = torch.logsumexp(logits, dim=1)
     expected_ids = target_token_ids[:, None].to(torch.int32)
@@ -830,7 +771,18 @@ def test_logits_processor_prompt_logprobs_tp1(num_logprobs: int) -> None:
         )
     expected_ranks = (logits >= target_logits[:, None]).sum(dim=1, dtype=torch.int32)
 
-    assert torch.equal(output_ids, expected_ids)
+    assert torch.equal(output_ids[:, 0], expected_ids[:, 0])
+    if num_logprobs > 0:
+        actual_topk_ids = output_ids[:, 1:].to(torch.int64)
+        actual_topk_values = logits.gather(1, actual_topk_ids)
+        torch.testing.assert_close(
+            actual_topk_values - lse[:, None],
+            output_logprobs[:, 1:],
+            rtol=0.0,
+            atol=1e-6,
+        )
+        sorted_ids = torch.sort(actual_topk_ids, dim=1).values
+        assert torch.all(sorted_ids[:, 1:] != sorted_ids[:, :-1])
     assert torch.equal(output_ranks, expected_ranks)
     torch.testing.assert_close(
         output_logprobs,

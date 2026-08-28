@@ -8,19 +8,18 @@ from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.kernels.linear.cute_dsl._lm_head_logprobs_mainloop import (
     _K0_GROUP_N,
-    _K0_REQUIRED_SMEM,
     _TILE_N,
     _TOPK_GROUP_N,
     _TOPK_PARTIAL_WIDTH,
-    _TOPK_REQUIRED_SMEM,
     _compile_lm_head_logprobs,
+    _validate_device_environment,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import cuda_get_device_properties
 from vllm.utils.torch_utils import current_stream
 
 
@@ -31,6 +30,11 @@ class LMHeadLogprobsOutput(NamedTuple):
     topk_ids: torch.Tensor
     lse: torch.Tensor
     rank_count: torch.Tensor
+
+
+_TARGET_GEMM_BLOCK_M = 128
+_SM80_LARGE_TARGET_GEMM_BLOCK_M = 1024
+_SM80_LARGE_TARGET_GEMM_MIN_ROWS = 513
 
 
 @triton.jit
@@ -63,67 +67,6 @@ def _unpack_logit_token_keys(keys):
         tl.where(valid, values, -float("inf")),
         tl.where(valid, token_ids, -1),
     )
-
-
-@triton.jit
-def _prompt_target_logits_kernel(
-    hidden_states_ptr,  # [M, H]
-    lm_head_weight_ptr,  # [V_local, H]
-    local_target_ids_ptr,  # [M], shard-local; invalid means non-owner
-    bias_ptr,  # optional [V_local]
-    output_ptr,  # [M] FP32
-    hidden_size,
-    local_vocab_size,
-    hidden_stride_m,
-    hidden_stride_h,
-    weight_stride_v,
-    weight_stride_h,
-    target_stride_m,
-    bias_stride_v,
-    BLOCK_H: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    # One program owns a row to avoid partial-result atomics.
-    row_idx = tl.program_id(0).to(tl.int64)
-    local_target_id = tl.load(local_target_ids_ptr + row_idx * target_stride_m).to(
-        tl.int64
-    )
-    is_local = (local_target_id >= 0) & (local_target_id < local_vocab_size)
-
-    # Clamp non-local IDs before pointer arithmetic; their loads remain masked.
-    safe_target_id = tl.where(is_local, local_target_id, 0)
-
-    # Fixed-width H tiles bound register pressure and support unpadded H.
-    target_logit = 0.0
-    for hidden_start in range(0, hidden_size, BLOCK_H):
-        hidden_offsets = hidden_start + tl.arange(0, BLOCK_H)
-        mask = is_local & (hidden_offsets < hidden_size)
-        hidden_values = tl.load(
-            hidden_states_ptr
-            + row_idx * hidden_stride_m
-            + hidden_offsets * hidden_stride_h,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        weight_values = tl.load(
-            lm_head_weight_ptr
-            + safe_target_id * weight_stride_v
-            + hidden_offsets * weight_stride_h,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        # Accumulate in FP32 before the TP reduction.
-        target_logit += tl.sum(hidden_values * weight_values)
-
-    if HAS_BIAS:
-        # Only the owner adds bias so the TP SUM includes it once.
-        target_logit += tl.load(
-            bias_ptr + safe_target_id * bias_stride_v,
-            mask=is_local,
-            other=0.0,
-        ).to(tl.float32)
-
-    tl.store(output_ptr + row_idx, tl.where(is_local, target_logit, 0.0))
 
 
 @triton.jit
@@ -387,91 +330,83 @@ def prompt_target_logits(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
     local_target_ids: torch.Tensor,
-    bias: torch.Tensor | None = None,
+    *,
+    block_m: int | None = None,
 ) -> torch.Tensor:
-    """Compute TP-local target logits without a full-vocabulary projection.
+    """Compute BF16 target logits with the platform GEMM accumulation path.
 
-    Args:
-        hidden_states: Prompt hidden states with shape [M, H].
-        lm_head_weight: Local unquantized LM-head weight with shape
-            [V_local, H].
-        local_target_ids: Shard-local target IDs with shape [M]. Values outside
-            [0, V_local) represent targets owned by another TP rank and produce
-            zero.
-        bias: Optional local LM-head bias with shape [V_local].
-
-    Returns:
-        FP32 local target logits with shape [M]. A TP SUM all-reduce turns these
-        local values into the global target logits.
+    The fused LM-head paths consume BF16 logits, while a standalone FP32 dot
+    product can round differently from the platform BF16 LM-head projection.
+    Grouping 128 rows into small square GEMMs keeps the target-only work compact
+    and follows the same tensor-core accumulation contract as the materialized
+    projection. ``block_m`` can match an architecture's preferred platform-GEMM
+    row shape. Non-local target IDs contribute zero before the TP SUM all-reduce.
     """
     if hidden_states.ndim != 2:
-        raise ValueError(
-            f"hidden_states must have shape [M, H], got {tuple(hidden_states.shape)}"
-        )
+        raise ValueError("hidden_states must have shape [M, H]")
     if lm_head_weight.ndim != 2:
-        raise ValueError(
-            "lm_head_weight must have shape [V_local, H], got "
-            f"{tuple(lm_head_weight.shape)}"
-        )
+        raise ValueError("lm_head_weight must have shape [V_local, H]")
     if hidden_states.shape[1] != lm_head_weight.shape[1]:
         raise ValueError(
             "hidden_states and lm_head_weight hidden dimensions must match"
         )
-    if (
-        local_target_ids.ndim != 1
-        or local_target_ids.shape[0] != hidden_states.shape[0]
-    ):
+    if local_target_ids.shape != (hidden_states.shape[0],):
         raise ValueError("local_target_ids must have shape [M]")
     if local_target_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError("local_target_ids must use torch.int32 or torch.int64")
-    if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError("hidden_states must use float16, bfloat16, or float32")
-    if lm_head_weight.dtype != hidden_states.dtype:
-        raise TypeError("lm_head_weight must have the same dtype as hidden_states")
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError("hidden_states must use bfloat16")
+    if lm_head_weight.dtype != torch.bfloat16:
+        raise TypeError("lm_head_weight must use bfloat16")
+    if block_m is not None and block_m <= 0:
+        raise ValueError("block_m must be positive")
     if not hidden_states.is_cuda or not lm_head_weight.is_cuda:
         raise ValueError("hidden_states and lm_head_weight must be CUDA tensors")
+    if hidden_states.device != lm_head_weight.device:
+        raise ValueError("hidden_states and lm_head_weight must share a device")
     if local_target_ids.device != hidden_states.device:
-        raise ValueError("local_target_ids must be on the same device as hidden_states")
-    if lm_head_weight.device != hidden_states.device:
-        raise ValueError("lm_head_weight must be on the same device as hidden_states")
-    if bias is not None:
-        if bias.ndim != 1 or bias.shape[0] != lm_head_weight.shape[0]:
-            raise ValueError("bias must have shape [V_local]")
-        if bias.dtype != hidden_states.dtype or bias.device != hidden_states.device:
-            raise ValueError(
-                "bias must have the same dtype and device as hidden_states"
-            )
+        raise ValueError("local_target_ids must share the input device")
 
     num_rows, hidden_size = hidden_states.shape
-    output = torch.empty(num_rows, dtype=torch.float32, device=hidden_states.device)
     if num_rows == 0:
-        return output
-    if hidden_size == 0 or lm_head_weight.shape[0] == 0:
-        output.zero_()
-        return output
+        return torch.empty(0, dtype=torch.float32, device=hidden_states.device)
+    local_vocab_size = lm_head_weight.shape[0]
+    if hidden_size == 0 or local_vocab_size == 0:
+        return torch.zeros(num_rows, dtype=torch.float32, device=hidden_states.device)
 
-    # Stream large H through fixed-width tiles instead of a large tl.arange.
-    block_h = min(triton.next_power_of_2(hidden_size), 1024)
-    num_warps = 4 if block_h <= 256 else 8
-    _prompt_target_logits_kernel[(num_rows,)](
-        hidden_states,
-        lm_head_weight,
-        local_target_ids,
-        bias,
-        output,
+    if block_m is None:
+        block_m = _TARGET_GEMM_BLOCK_M
+        device_index = hidden_states.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        capability = current_platform.get_device_capability(device_index)
+        if (
+            capability is not None
+            and capability.to_int() == 80
+            and num_rows >= _SM80_LARGE_TARGET_GEMM_MIN_ROWS
+        ):
+            block_m = _SM80_LARGE_TARGET_GEMM_BLOCK_M
+
+    is_local = (local_target_ids >= 0) & (local_target_ids < local_vocab_size)
+    safe_target_ids = torch.where(is_local, local_target_ids, 0).to(torch.int64)
+    padded_rows = ((num_rows + block_m - 1) // block_m) * block_m
+    if padded_rows != num_rows:
+        row_padding = padded_rows - num_rows
+        hidden_states = F.pad(hidden_states, (0, 0, 0, row_padding))
+        safe_target_ids = F.pad(safe_target_ids, (0, row_padding))
+
+    num_blocks = padded_rows // block_m
+    selected_weight = lm_head_weight.index_select(0, safe_target_ids).view(
+        num_blocks,
+        block_m,
         hidden_size,
-        lm_head_weight.shape[0],
-        hidden_states.stride(0),
-        hidden_states.stride(1),
-        lm_head_weight.stride(0),
-        lm_head_weight.stride(1),
-        local_target_ids.stride(0),
-        1 if bias is None else bias.stride(0),
-        BLOCK_H=block_h,
-        HAS_BIAS=bias is not None,
-        num_warps=num_warps,
     )
-    return output
+    block_logits = torch.bmm(
+        hidden_states.view(num_blocks, block_m, hidden_size),
+        selected_weight.transpose(1, 2),
+    )
+    target_logits = block_logits.diagonal(dim1=1, dim2=2).reshape(-1)[:num_rows]
+    return torch.where(is_local, target_logits.float(), 0.0)
 
 
 def materialized_lse_and_rank(
@@ -545,28 +480,33 @@ def validate_lm_head_logprobs_environment(lm_head_weight: torch.Tensor) -> None:
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    capability = current_platform.get_device_capability(device_index)
-    if capability is None or capability.major < 8:
-        current_sm = "unknown" if capability is None else capability.to_int()
-        raise RuntimeError(
-            "the compact prompt-logprobs path requires SM80 or newer; "
-            f"the current GPU is SM{current_sm}"
-        )
+    _validate_device_environment(device_index)
 
-    try:
-        (max_smem,) = cuda_get_device_properties(
-            device_index, ("shared_memory_per_block_optin",), init_cuda=True
-        )
-    except AttributeError:
-        (max_smem,) = cuda_get_device_properties(
-            device_index, ("shared_memory_per_block",), init_cuda=True
-        )
-    required_smem = max(_K0_REQUIRED_SMEM, _TOPK_REQUIRED_SMEM)
-    if max_smem < required_smem:
-        raise RuntimeError(
-            f"the current GPU exposes only {max_smem // 1024} KiB shared memory; "
-            f"the compact prompt-logprobs path requires {required_smem // 1024} KiB"
-        )
+
+def uses_sm90_lm_head_logprobs(hidden_states: torch.Tensor) -> bool:
+    """Return whether this input uses the Hopper WGMMA specialization."""
+    if not hidden_states.is_cuda:
+        return False
+    device_index = hidden_states.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device_index)
+    return (
+        capability is not None
+        and capability.to_int() == 90
+        and hidden_states.shape[1] >= 128
+    )
+
+
+def uses_sm80_lm_head_logprobs(hidden_states: torch.Tensor) -> bool:
+    """Return whether this input uses the A100 warp-MMA specialization."""
+    if not hidden_states.is_cuda:
+        return False
+    device_index = hidden_states.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device_index)
+    return capability is not None and capability.to_int() == 80
 
 
 def lm_head_logprobs(
@@ -609,10 +549,6 @@ def lm_head_logprobs(
     if not 0 <= num_topk <= 32:
         raise ValueError("num_topk must be in [0, 32]")
     topk_bucket = 0 if num_topk == 0 else 1 << (num_topk - 1).bit_length()
-    # Keep only two CuTe specializations. Triton reduces the fixed top-32
-    # partials to the exact requested width before TP communication.
-    partial_topk_width = 0 if num_topk == 0 else _TOPK_PARTIAL_WIDTH
-    group_n = _K0_GROUP_N if num_topk == 0 else _TOPK_GROUP_N
     if hidden_states.ndim != 2 or lm_head_weight.ndim != 2:
         raise ValueError("hidden_states and lm_head_weight must be matrices")
     if hidden_states.shape[1] != lm_head_weight.shape[1]:
@@ -666,6 +602,21 @@ def lm_head_logprobs(
             torch.empty(0, dtype=torch.int32, device=hidden_states.device),
         )
 
+    device_index = hidden_states.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    # The three-stage Hopper pipeline needs at least two 64-wide K tiles.
+    # Tiny synthetic heads use the original warp-MMA specialization instead
+    # of carrying a dynamic short-pipeline branch in the production hot path.
+    use_sm90 = uses_sm90_lm_head_logprobs(hidden_states)
+    use_sm80 = not use_sm90 and uses_sm80_lm_head_logprobs(hidden_states)
+    if num_topk == 0:
+        partial_topk_width = 0
+        group_n = _K0_GROUP_N
+    else:
+        partial_topk_width = num_topk if use_sm80 else _TOPK_PARTIAL_WIDTH
+        group_n = _TOPK_GROUP_N
+
     target_ids = local_target_ids.to(dtype=torch.int32).contiguous()
     target_logits = global_target_logits.contiguous()
     # A CTA emits one partial for group_n adjacent vocabulary blocks.
@@ -693,9 +644,6 @@ def lm_head_logprobs(
         num_rows, dtype=torch.int32, device=hidden_states.device
     )
 
-    device_index = hidden_states.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
     # Static H/V/K dimensions select a cached CuTe specialization; M remains
     # symbolic so chunk lengths do not trigger recompilation.
     with torch.accelerator.device_index(device_index):
@@ -706,6 +654,8 @@ def lm_head_logprobs(
             device_index,
             partial_topk_width,
             group_n,
+            use_sm80,
+            use_sm90,
         )
         stream = cuda.CUstream(current_stream().cuda_stream)
         compiled(

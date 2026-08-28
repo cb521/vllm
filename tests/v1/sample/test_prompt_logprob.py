@@ -178,7 +178,7 @@ def test_init_compact_prompt_logprobs_resolves_model_components(
     ranks = torch.tensor([1], dtype=torch.int32)
     logits_processor = Mock()
     logits_processor.get_prompt_logprobs.return_value = token_ids, logprobs, ranks
-    lm_head = Mock()
+    lm_head = Mock(tp_size=2)
     language_model = SimpleNamespace(
         logits_processor=logits_processor,
         lm_head=lm_head,
@@ -274,16 +274,97 @@ def test_is_h20_device_name(device_name: str, expected: bool) -> None:
     assert prompt_logprob._is_h20_device_name(device_name) is expected
 
 
-@pytest.mark.parametrize("backend", ["fused", "materialized"])
-def test_prompt_logprobs_backend_override(
-    backend: str,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("device_name", "expected"),
+    [
+        ("NVIDIA A100 80GB PCIe", True),
+        ("NVIDIA A100-SXM4-80GB", True),
+        ("NVIDIA A10", False),
+        ("NVIDIA RTX A1000", False),
+    ],
+)
+def test_is_a100_device_name(device_name: str, expected: bool) -> None:
+    assert prompt_logprob._is_a100_device_name(device_name) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "device_name",
+        "tp_size",
+        "num_rows",
+        "num_logprobs",
+        "workspace_limit_mib",
+        "expected",
+    ),
+    [
+        ("NVIDIA H20", 2, 1, 20, 256, "native"),
+        ("NVIDIA H20", 2, 2, 20, 256, "materialized"),
+        ("NVIDIA H20", 4, 31, 20, 256, "native"),
+        ("NVIDIA H20", 4, 32, 20, 256, "materialized"),
+        ("NVIDIA H20", 8, 31, 0, 256, "native"),
+        ("NVIDIA H20", 8, 32, 0, 256, "materialized"),
+        ("NVIDIA H20", 8, 63, 20, 256, "native"),
+        ("NVIDIA H20", 8, 64, 20, 256, "materialized"),
+        ("NVIDIA H20", 2, 1024, 20, 128, "fused"),
+        ("NVIDIA A100-SXM4-80GB", 1, 1024, 20, 256, "native"),
+        ("NVIDIA A100 80GB PCIe", 2, 128, 20, 256, "fused"),
+        ("NVIDIA A100 80GB PCIe", 2, 256, 0, 256, "materialized"),
+        ("NVIDIA A100 80GB PCIe", 2, 512, 0, 256, "fused"),
+        ("NVIDIA A100 80GB PCIe", 2, 1024, 20, 256, "materialized"),
+        ("NVIDIA A100-SXM4-80GB", 4, 512, 0, 256, "materialized"),
+        ("NVIDIA A100-SXM4-80GB", 4, 1024, 0, 256, "fused"),
+        ("NVIDIA A100-SXM4-80GB", 4, 1024, 32, 256, "materialized"),
+        ("NVIDIA A100-SXM4-80GB", 2, 1024, 20, 128, "fused"),
+        ("NVIDIA A100-SXM4-80GB", 8, 1024, 20, 256, "materialized"),
+        ("NVIDIA H100 80GB HBM3", 2, 1024, 20, 256, "fused"),
+    ],
+)
+def test_select_auto_chunk_backend(
+    device_name: str,
+    tp_size: int,
+    num_rows: int,
+    num_logprobs: int,
+    workspace_limit_mib: int,
+    expected: str,
 ) -> None:
-    monkeypatch.setenv("VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND", backend)
+    selected = prompt_logprob._select_auto_chunk_backend(
+        device_name=device_name,
+        tp_size=tp_size,
+        num_rows=num_rows,
+        num_logprobs=num_logprobs,
+        local_vocab_size=124160,
+        element_size=2,
+        materialized_workspace_limit_bytes=workspace_limit_mib * 1024 * 1024,
+    )
 
-    selected = prompt_logprob._select_prompt_logprobs_backend(SimpleNamespace())
+    assert selected == expected
 
-    assert selected == backend
+
+@pytest.mark.parametrize(
+    ("num_rows", "num_logprobs", "expected"),
+    [
+        (255, 20, "fused"),
+        (256, 0, "materialized"),
+        (1024, 0, "materialized"),
+        (1024, 20, "materialized"),
+        (1025, 20, "fused"),
+    ],
+)
+def test_select_auto_a100_tp8_production_chunks(
+    num_rows: int,
+    num_logprobs: int,
+    expected: str,
+) -> None:
+    selected = prompt_logprob._select_auto_chunk_backend(
+        device_name="NVIDIA A100 80GB PCIe",
+        tp_size=8,
+        num_rows=num_rows,
+        num_logprobs=num_logprobs,
+        local_vocab_size=31040,
+        element_size=2,
+    )
+
+    assert selected == expected
 
 
 def test_kernel_warmup_delegates_to_compact_prompt_logprobs() -> None:

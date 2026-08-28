@@ -28,6 +28,7 @@ from vllm.distributed import (
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
+    set_custom_all_reduce,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
@@ -56,6 +57,10 @@ class Result:
     compact_peak_mib: float
     materialized_peak_mib: float
     compact_target_max_abs_error: float
+    compact_target_mean_abs_error: float
+    compact_score_max_abs_error: float
+    compact_token_ids_match: bool
+    compact_ranks_match: bool
     materialized_target_max_abs_error: float
     materialized_target_mean_abs_error: float
     materialized_score_max_abs_error: float
@@ -64,8 +69,10 @@ class Result:
     baseline_collective_payload_mib_per_rank: float
     compact_collective_payload_mib_per_rank: float
     baseline_time_spread_percent: float
+    compact_time_spread_percent: float
     materialized_time_spread_percent: float
     baseline_memory_spread_mib: float
+    compact_memory_spread_mib: float
     materialized_memory_spread_mib: float
     baseline_communication_ms: float
     compact_communication_ms: float
@@ -105,6 +112,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-scale", type=float, default=0.02)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--baseline-warmup", type=int)
+    parser.add_argument("--baseline-repeats", type=int)
+    parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Use materialized compact results as the reference and skip full logits",
+    )
+    parser.add_argument("--disable-custom-all-reduce", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--output", type=str)
     return parser.parse_args()
@@ -191,6 +206,25 @@ def spread_percent(minimum: float, maximum: float) -> float:
     return 0.0 if maximum == 0.0 else (maximum - minimum) / maximum * 100
 
 
+def collect_environment(local_rank: int, world_size: int) -> dict[str, Any]:
+    """Collect enough per-rank metadata to audit cross-GPU comparisons."""
+    properties = torch.cuda.get_device_properties(local_rank)
+    local_device = {
+        "rank": dist.get_rank(),
+        "name": properties.name,
+        "capability": f"{properties.major}.{properties.minor}",
+        "total_memory_mib": properties.total_memory / (1024**2),
+    }
+    devices: list[dict[str, Any] | None] = [None] * world_size
+    dist.all_gather_object(devices, local_device)
+    return {
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "world_size": world_size,
+        "devices": devices,
+    }
+
+
 def run_case(
     processor: LogitsProcessor,
     lm_head: Any,
@@ -199,6 +233,9 @@ def run_case(
     top_k: int,
     warmup: int,
     repeats: int,
+    baseline_warmup: int,
+    baseline_repeats: int,
+    skip_baseline: bool,
     world_size: int,
 ) -> Result:
     def baseline():
@@ -215,53 +252,90 @@ def run_case(
             lm_head, hidden_states, target_token_ids, top_k
         )
 
-    reference_logits = processor(lm_head, hidden_states)
-    expected = compute_topk_scores(reference_logits, top_k, target_token_ids)
-    reference_lse = torch.logsumexp(reference_logits.float(), dim=1)
-    reference_target_scores = (
-        reference_logits.gather(1, target_token_ids[:, None]).squeeze(1).float()
-        - reference_lse
-    )
-    _, actual_scores, _ = compact()
     materialized_ids, materialized_scores, materialized_ranks = materialized()
+    if skip_baseline:
+        expected_ids = materialized_ids
+        expected_scores = materialized_scores
+        expected_ranks = materialized_ranks
+        reference_target_scores = materialized_scores[:, 0]
+    else:
+        reference_logits = processor(lm_head, hidden_states)
+        expected = compute_topk_scores(reference_logits, top_k, target_token_ids)
+        reference_lse = torch.logsumexp(reference_logits.float(), dim=1)
+        reference_target_scores = (
+            reference_logits.gather(1, target_token_ids[:, None]).squeeze(1).float()
+            - reference_lse
+        )
+        expected_ids = expected.logprob_token_ids
+        expected_scores = expected.logprobs
+        expected_ranks = expected.selected_token_ranks
+    actual_ids, actual_scores, actual_ranks = compact()
     torch.accelerator.synchronize()
     compact_target_error = (actual_scores[:, 0] - reference_target_scores).abs()
+    compact_score_error = (actual_scores - expected_scores).abs()
     materialized_target_error = (
         materialized_scores[:, 0] - reference_target_scores
     ).abs()
-    materialized_score_error = (materialized_scores - expected.logprobs).abs()
-    del reference_logits, reference_lse, reference_target_scores
+    materialized_score_error = (materialized_scores - expected_scores).abs()
+    if not skip_baseline:
+        del reference_logits, reference_lse
+    del reference_target_scores
 
-    baseline_ms = median_cuda_ms(baseline, warmup, repeats)
+    baseline_ms = (
+        float("nan")
+        if skip_baseline
+        else median_cuda_ms(baseline, baseline_warmup, baseline_repeats)
+    )
     compact_ms = median_cuda_ms(compact, warmup, repeats)
     materialized_ms = median_cuda_ms(materialized, warmup, repeats)
-    baseline_peak_mib = incremental_peak_mib(baseline)
+    baseline_peak_mib = (
+        float("nan") if skip_baseline else incremental_peak_mib(baseline)
+    )
     compact_peak_mib = incremental_peak_mib(compact)
     materialized_peak_mib = incremental_peak_mib(materialized)
 
     device = hidden_states.device
-    baseline_min_ms = reduce_min(baseline_ms, device)
+    baseline_min_ms = baseline_ms if skip_baseline else reduce_min(baseline_ms, device)
+    compact_min_ms = reduce_min(compact_ms, device)
     materialized_min_ms = reduce_min(materialized_ms, device)
-    baseline_ms = reduce_max(baseline_ms, device)
+    if not skip_baseline:
+        baseline_ms = reduce_max(baseline_ms, device)
     compact_ms = reduce_max(compact_ms, device)
     materialized_ms = reduce_max(materialized_ms, device)
-    baseline_min_peak_mib = reduce_min(baseline_peak_mib, device)
+    baseline_min_peak_mib = (
+        baseline_peak_mib if skip_baseline else reduce_min(baseline_peak_mib, device)
+    )
+    compact_min_peak_mib = reduce_min(compact_peak_mib, device)
     materialized_min_peak_mib = reduce_min(materialized_peak_mib, device)
-    baseline_peak_mib = reduce_max(baseline_peak_mib, device)
+    if not skip_baseline:
+        baseline_peak_mib = reduce_max(baseline_peak_mib, device)
     compact_peak_mib = reduce_max(compact_peak_mib, device)
     materialized_peak_mib = reduce_max(materialized_peak_mib, device)
 
-    materialized_ids_match = torch.equal(materialized_ids, expected.logprob_token_ids)
+    compact_ids_match = torch.equal(actual_ids, expected_ids)
+    compact_ranks_match = torch.equal(
+        actual_ranks.to(torch.int64), expected_ranks.to(torch.int64)
+    )
+    materialized_ids_match = torch.equal(materialized_ids, expected_ids)
     materialized_ranks_match = torch.equal(
-        materialized_ranks.to(torch.int64), expected.selected_token_ranks
+        materialized_ranks.to(torch.int64), expected_ranks.to(torch.int64)
     )
     matches = torch.tensor(
-        [materialized_ids_match, materialized_ranks_match],
+        [
+            compact_ids_match,
+            compact_ranks_match,
+            materialized_ids_match,
+            materialized_ranks_match,
+        ],
         dtype=torch.int32,
         device=device,
     )
     dist.all_reduce(matches, op=dist.ReduceOp.MIN)
     compact_max_error = reduce_max(float(compact_target_error.max().item()), device)
+    compact_mean_error = reduce_max(float(compact_target_error.mean().item()), device)
+    compact_score_max_error = reduce_max(
+        float(compact_score_error.max().item()), device
+    )
     materialized_max_error = reduce_max(
         float(materialized_target_error.max().item()), device
     )
@@ -286,7 +360,6 @@ def run_case(
         compact_payload_mib = (
             hidden_states.shape[0] * (1 + 2 * top_k + 2) * 4 / (1024**2)
         )
-        local_logits = processor._apply_head(lm_head, hidden_states, None)
         target_state = torch.zeros(
             hidden_states.shape[0], dtype=torch.float32, device=device
         )
@@ -296,17 +369,27 @@ def run_case(
             device=device,
         )
 
-        def baseline_communication():
-            return tensor_model_parallel_all_gather(local_logits)
-
         def compact_communication():
             target = tensor_model_parallel_all_reduce(target_state)
             state = tensor_model_parallel_all_gather(compact_state, dim=0)
             return target, state
 
-        baseline_communication_ms = reduce_max(
-            median_cuda_ms(baseline_communication, warmup, repeats), device
-        )
+        if skip_baseline:
+            baseline_communication_ms = float("nan")
+        else:
+            local_logits = processor._apply_head(lm_head, hidden_states, None)
+
+            def baseline_communication():
+                return tensor_model_parallel_all_gather(local_logits)
+
+            baseline_communication_ms = reduce_max(
+                median_cuda_ms(
+                    baseline_communication,
+                    baseline_warmup,
+                    baseline_repeats,
+                ),
+                device,
+            )
         compact_communication_ms = reduce_max(
             median_cuda_ms(compact_communication, warmup, repeats), device
         )
@@ -324,18 +407,24 @@ def run_case(
         compact_peak_mib=compact_peak_mib,
         materialized_peak_mib=materialized_peak_mib,
         compact_target_max_abs_error=compact_max_error,
+        compact_target_mean_abs_error=compact_mean_error,
+        compact_score_max_abs_error=compact_score_max_error,
+        compact_token_ids_match=bool(matches[0].item()),
+        compact_ranks_match=bool(matches[1].item()),
         materialized_target_max_abs_error=materialized_max_error,
         materialized_target_mean_abs_error=materialized_mean_error,
         materialized_score_max_abs_error=materialized_score_max_error,
-        materialized_token_ids_match=bool(matches[0].item()),
-        materialized_ranks_match=bool(matches[1].item()),
+        materialized_token_ids_match=bool(matches[2].item()),
+        materialized_ranks_match=bool(matches[3].item()),
         baseline_collective_payload_mib_per_rank=baseline_payload_mib,
         compact_collective_payload_mib_per_rank=compact_payload_mib,
         baseline_time_spread_percent=spread_percent(baseline_min_ms, baseline_ms),
+        compact_time_spread_percent=spread_percent(compact_min_ms, compact_ms),
         materialized_time_spread_percent=spread_percent(
             materialized_min_ms, materialized_ms
         ),
         baseline_memory_spread_mib=baseline_peak_mib - baseline_min_peak_mib,
+        compact_memory_spread_mib=compact_peak_mib - compact_min_peak_mib,
         materialized_memory_spread_mib=(
             materialized_peak_mib - materialized_min_peak_mib
         ),
@@ -362,7 +451,7 @@ def run_prompt_case(
     compact = CompactPromptLogprobs(
         processor,
         lm_head,
-        backend="materialized",
+        backend="auto",
     )
 
     def baseline():
@@ -453,11 +542,27 @@ def run_prompt_case(
 
 def main() -> None:
     args = parse_args()
+    baseline_warmup = (
+        args.warmup if args.baseline_warmup is None else args.baseline_warmup
+    )
+    baseline_repeats = (
+        args.repeats if args.baseline_repeats is None else args.baseline_repeats
+    )
+    if baseline_warmup < 0:
+        raise ValueError("baseline warmup must be non-negative")
+    if baseline_repeats < 1:
+        raise ValueError("baseline repeats must be positive")
+    if args.skip_baseline and args.prompt_lengths:
+        raise ValueError("--skip-baseline does not support --prompt-lengths")
     config = VllmConfig()
+    config.parallel_config.disable_custom_all_reduce = args.disable_custom_all_reduce
+    if args.disable_custom_all_reduce:
+        set_custom_all_reduce(False)
     with set_current_vllm_config(config):
         world_size, rank, local_rank = init_distributed()
         if args.vocab_size % world_size:
             raise ValueError("vocab size must be divisible by the TP size")
+        environment = collect_environment(local_rank, world_size)
 
         device = torch.device("cuda", local_rank)
         local_vocab_size = args.vocab_size // world_size
@@ -495,6 +600,9 @@ def main() -> None:
                     top_k,
                     args.warmup,
                     args.repeats,
+                    baseline_warmup,
+                    baseline_repeats,
+                    args.skip_baseline,
                     world_size,
                 )
                 results.append(result)
@@ -537,6 +645,8 @@ def main() -> None:
             with open(args.output, "w", encoding="utf-8") as output_file:
                 json.dump(
                     {
+                        "environment": environment,
+                        "config": vars(args),
                         "kernel_results": [asdict(result) for result in results],
                         "prompt_results": [asdict(result) for result in prompt_results],
                     },

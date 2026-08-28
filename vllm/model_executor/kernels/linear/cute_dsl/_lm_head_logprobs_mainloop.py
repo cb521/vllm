@@ -29,17 +29,19 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""CuTe DSL LM-head projection for SM80+ GPUs with at least 144 KiB
-of opt-in shared memory.
+"""CuTe DSL LM-head projection for SM80+ GPUs with sufficient opt-in SMEM.
 
-The GEMM mainloop is derived from CUTLASS's Ampere TensorOp GEMM example. It
-uses a multistage ``cp.async`` pipeline and BF16 tensor-core MMA with FP32
-accumulation. Logit tiles exist only in registers and CTA shared memory; the
-kernel never writes a global ``[M, V]`` logits tensor.
+The SM80 mainloop is derived from CUTLASS's Ampere TensorOp GEMM example.
+The SM90 specialization uses Hopper WGMMA with a three-stage ``cp.async``
+pipeline. Both use BF16 tensor-core MMA with FP32 accumulation. Logit tiles
+exist only in registers and CTA shared memory; the kernel never writes a
+global ``[M, V]`` logits tensor.
 """
 
 # Modified from NVIDIA CUTLASS v4.4.2:
 # https://github.com/NVIDIA/cutlass/blob/da5e086dab31d63815acafdac9a9c5893b1c69e2/examples/python/CuTeDSL/ampere/tensorop_gemm.py  # noqa: E501
+# Hopper WGMMA layout and mainloop conventions are adapted from:
+# https://github.com/NVIDIA/cutlass/blob/da5e086dab31d63815acafdac9a9c5893b1c69e2/examples/python/CuTeDSL/hopper/dense_gemm.py  # noqa: E501
 
 from __future__ import annotations
 
@@ -51,6 +53,7 @@ import cutlass
 import cutlass.utils as cutlass_utils
 from cutlass import cute
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
+from cutlass.utils import hopper_helpers as sm90_utils
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
@@ -69,7 +72,10 @@ _K0_REQUIRED_SMEM = 144 * 1024
 _TOPK_REQUIRED_SMEM = 144 * 1024
 
 
-def _validate_device_environment(device_index: int) -> None:
+def _validate_device_environment(
+    device_index: int,
+    required_smem: int = max(_K0_REQUIRED_SMEM, _TOPK_REQUIRED_SMEM),
+) -> None:
     """Validate GPU requirements when a CuTe specialization compiles."""
     capability = current_platform.get_device_capability(device_index)
     if capability is None or capability.major < 8:
@@ -87,7 +93,6 @@ def _validate_device_environment(device_index: int) -> None:
         (max_smem,) = cuda_get_device_properties(
             device_index, ("shared_memory_per_block",), init_cuda=True
         )
-    required_smem = max(_K0_REQUIRED_SMEM, _TOPK_REQUIRED_SMEM)
     if max_smem < required_smem:
         raise RuntimeError(
             f"the current GPU exposes only {max_smem // 1024} KiB shared memory; "
@@ -179,18 +184,7 @@ class _LMHeadLogprobsCpAsync:
             mB.element_type,
             (self.tile_n, self.tile_k, self.num_stages),
         )
-        # K=0 reduces per-N-warp statistics directly from the accumulator.
-        # Top-K needs the complete logits tile for row-wise warp selection.
-        if cutlass.const_expr(self.num_topk == 0):
-            stats_width = self.atom_layout_mnk[1] * 3
-            sC_layout = cute.make_layout(
-                (self.tile_m, stats_width),
-                stride=(stats_width, 1),
-            )
-        else:
-            sC_layout = cute.make_layout(
-                (self.tile_m, self.tile_n), stride=(self.tile_n, 1)
-            )
+        sC_layout = self._make_epilogue_smem_layout()
 
         # Both operands use 128-bit cp.async copies into swizzled SMEM tiles.
         copy_atom_A = cute.make_copy_atom(
@@ -205,18 +199,7 @@ class _LMHeadLogprobsCpAsync:
         )
         tiled_copy_A = self._make_gmem_tiled_copy(copy_atom_A, mA.element_type)
         tiled_copy_B = self._make_gmem_tiled_copy(copy_atom_B, mB.element_type)
-        mma_op = cute.nvgpu.warp.MmaF16BF16Op(
-            mA.element_type, cutlass.Float32, (16, 8, 16)
-        )
-        tiled_mma = cute.make_tiled_mma(
-            mma_op,
-            cute.make_layout(self.atom_layout_mnk),
-            permutation_mnk=(
-                self.atom_layout_mnk[0] * 16,
-                self.atom_layout_mnk[1] * 16,
-                16,
-            ),
-        )
+        tiled_mma = self._make_tiled_mma(mA.element_type, mB.element_type)
         # One CTA owns a row tile and group_n consecutive vocabulary tiles.
         num_row_blocks = cute.ceil_div(mA.shape[0], self.tile_m)
         num_output_groups = cute.ceil_div(num_vocab_blocks, self.group_n)
@@ -279,9 +262,13 @@ class _LMHeadLogprobsCpAsync:
     ):
         # Flatten the row/vocabulary-group grid to keep the launch one-dimensional.
         block_linear, _, _ = cute.arch.block_idx()
+        num_row_blocks = cute.ceil_div(mA.shape[0], self.tile_m)
         num_output_groups = cute.ceil_div(num_vocab_blocks, self.group_n)
-        block_m = block_linear // num_output_groups
-        output_group = block_linear % num_output_groups
+        block_m, output_group = self._decode_block_index(
+            block_linear,
+            num_row_blocks,
+            num_output_groups,
+        )
         first_vocab_block = vocab_block_start + output_group * self.group_n
 
         @cute.struct
@@ -907,7 +894,9 @@ class _LMHeadLogprobsCpAsync:
             target_logit = cutlass.Float32(0.0)
             if row_valid:
                 target_id = mTargetIds[row]
-                target_logit = mTargetLogits[row]
+                target_logit = self._prepare_epilogue_logit(
+                    mTargetLogits[row], mA.element_type
+                )
 
             # A warp covers 256 vocabulary entries with eight values per lane.
             candidates = cute.make_rmem_tensor(8, cutlass.Float32)
@@ -919,7 +908,9 @@ class _LMHeadLogprobsCpAsync:
                 local_vocab_id = vocab_start + n
                 logit = -cutlass.Float32.inf
                 if row_valid and local_vocab_id < valid_vocab_size:
-                    logit = sC[row_in_tile, n]
+                    logit = self._prepare_epilogue_logit(
+                        sC[row_in_tile, n], mA.element_type
+                    )
                     # Use the separately computed global target value so rank
                     # and returned target logprob share the same TP-reduced logit.
                     if target_id == local_vocab_id:
@@ -1018,13 +1009,16 @@ class _LMHeadLogprobsCpAsync:
         ):
             accumulator_row = accumulator_mn[local_row_slot, None]
             coordinate_row = coordinates_mn[local_row_slot, None]
+            self._prepare_accumulator_row(accumulator_row, mA.element_type)
             local_row = coordinate_row[0][0]
             row = block_m * self.tile_m + local_row
             target_id = cutlass.Int32(-1)
             target_logit = cutlass.Float32(0.0)
             if row < mA.shape[0]:
                 target_id = mTargetIds[row]
-                target_logit = mTargetLogits[row]
+                target_logit = self._prepare_epilogue_logit(
+                    mTargetLogits[row], mA.element_type
+                )
 
             row_max = -cutlass.Float32.inf
             rank_count = cutlass.Int32(0)
@@ -1110,6 +1104,46 @@ class _LMHeadLogprobsCpAsync:
                 running_max[0] = merged_max
                 running_rank_count[0] += tile_rank_count
 
+    @cute.jit
+    def _prepare_epilogue_logit(self, value, output_dtype):
+        # The observable platform LM-head tensor has the input BF16 dtype even
+        # though tensor-core MMA accumulates in FP32.
+        return value.to(output_dtype).to(cutlass.Float32)
+
+    @cute.jit
+    def _prepare_accumulator_row(self, accumulator_row, output_dtype):
+        for element in cutlass.range_constexpr(cute.size(accumulator_row)):
+            accumulator_row[element] = self._prepare_epilogue_logit(
+                accumulator_row[element], output_dtype
+            )
+
+    @cute.jit
+    def _decode_block_index(self, block_linear, _num_row_blocks, num_output_groups):
+        return block_linear // num_output_groups, block_linear % num_output_groups
+
+    def _make_tiled_mma(self, a_dtype, _b_dtype):
+        mma_op = cute.nvgpu.warp.MmaF16BF16Op(a_dtype, cutlass.Float32, (16, 8, 16))
+        return cute.make_tiled_mma(
+            mma_op,
+            cute.make_layout(self.atom_layout_mnk),
+            permutation_mnk=(
+                self.atom_layout_mnk[0] * 16,
+                self.atom_layout_mnk[1] * 16,
+                16,
+            ),
+        )
+
+    def _make_epilogue_smem_layout(self):
+        # K=0 reduces per-N-warp statistics directly from the accumulator.
+        # Top-K needs the complete logits tile for row-wise warp selection.
+        if self.num_topk == 0:
+            stats_width = self.atom_layout_mnk[1] * 3
+            return cute.make_layout(
+                (self.tile_m, stats_width),
+                stride=(stats_width, 1),
+            )
+        return cute.make_layout((self.tile_m, self.tile_n), stride=(self.tile_n, 1))
+
     def _make_smem_layout(self, dtype, smem_tiler):
         major_size = min(smem_tiler[1], 128 * 8 // dtype.width)
         swizzle_bits = min(int(math.log2(major_size * dtype.width // 128)), 3)
@@ -1130,6 +1164,381 @@ class _LMHeadLogprobsCpAsync:
         return cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
 
 
+class _LMHeadLogprobsSm80(_LMHeadLogprobsCpAsync):
+    """Ampere warp-MMA specialization with vocabulary-major scheduling."""
+
+    @cute.jit
+    def _decode_block_index(self, block_linear, num_row_blocks, _num_output_groups):
+        return block_linear % num_row_blocks, block_linear // num_row_blocks
+
+
+class _LMHeadLogprobsSm90(_LMHeadLogprobsCpAsync):
+    """Hopper WGMMA mainloop with the existing compact Top-K epilogue."""
+
+    def _make_tiled_mma(self, a_dtype, b_dtype):
+        row_major = cutlass_utils.LayoutEnum.ROW_MAJOR
+        return sm90_utils.make_trivial_tiled_mma(
+            a_dtype,
+            b_dtype,
+            row_major.sm90_mma_major_mode(),
+            row_major.sm90_mma_major_mode(),
+            cutlass.Float32,
+            (1, 1, 1),
+            tiler_mn=(64, self.tile_n),
+        )
+
+    def _make_epilogue_smem_layout(self):
+        # Both SM90 epilogues consume row-major logits staged after WGMMA.
+        return cute.make_layout((self.tile_m, self.tile_n), stride=(self.tile_n, 1))
+
+    def _make_smem_layout(self, dtype, smem_tiler):
+        row_major = cutlass_utils.LayoutEnum.ROW_MAJOR
+        tile_shape_mnk = (self.tile_m, self.tile_n, self.tile_k)
+        if smem_tiler[0] == self.tile_m:
+            staged = sm90_utils.make_smem_layout_a(
+                row_major,
+                tile_shape_mnk,
+                dtype,
+                self.num_stages,
+            )
+        else:
+            staged = sm90_utils.make_smem_layout_b(
+                row_major,
+                tile_shape_mnk,
+                dtype,
+                self.num_stages,
+            )
+        return staged.outer, staged.inner
+
+    @cute.jit
+    def _update_stats_from_smem(
+        self,
+        sC: cute.Tensor,
+        mA: cute.Tensor,
+        mTargetIds: cute.Tensor,
+        mTargetLogits: cute.Tensor,
+        valid_vocab_size: cutlass.Int32,
+        vocab_block: cutlass.Int32,
+        block_m: cutlass.Int32,
+        running_max: cute.Tensor,
+        running_sum_exp: cute.Tensor,
+        running_rank_count: cute.Tensor,
+    ):
+        """Reduce a WGMMA tile with one two-thread group per output row."""
+        tidx, _, _ = cute.arch.thread_idx()
+        threads_per_row = self.num_threads // self.tile_m
+        row_in_tile = tidx // threads_per_row
+        lane_in_row = tidx % threads_per_row
+        row = block_m * self.tile_m + row_in_tile
+        row_valid = row < mA.shape[0]
+        target_id = cutlass.Int32(-1)
+        target_logit = cutlass.Float32(0.0)
+        if row_valid:
+            target_id = mTargetIds[row]
+            target_logit = self._prepare_epilogue_logit(
+                mTargetLogits[row], mA.element_type
+            )
+
+        vocab_start = vocab_block * self.tile_n
+        row_max = -cutlass.Float32.inf
+        rank_count = cutlass.Int32(0)
+        values_per_thread = self.tile_n // threads_per_row
+        # Tail CTAs can contain very few live rows. Let their inactive
+        # two-thread groups skip the 128-value reduction entirely.
+        if row_valid:
+            for value_idx in cutlass.range(values_per_thread, unroll=4):
+                n = lane_in_row + value_idx * threads_per_row
+                local_vocab_id = vocab_start + n
+                if local_vocab_id < valid_vocab_size:
+                    logit = self._prepare_epilogue_logit(
+                        sC[row_in_tile, n], mA.element_type
+                    )
+                    if target_id == local_vocab_id:
+                        logit = target_logit
+                    row_max = cute.arch.fmax(row_max, logit)
+                    if logit >= target_logit:
+                        rank_count += 1
+
+        other_max = cute.arch.shuffle_sync_bfly(row_max, offset=1)
+        row_max = cute.arch.fmax(row_max, other_max)
+        other_rank = cute.arch.shuffle_sync_bfly(rank_count, offset=1)
+        rank_count += other_rank
+
+        row_sum_exp = cutlass.Float32(0.0)
+        if row_valid:
+            for value_idx in cutlass.range(values_per_thread, unroll=4):
+                n = lane_in_row + value_idx * threads_per_row
+                local_vocab_id = vocab_start + n
+                if local_vocab_id < valid_vocab_size:
+                    logit = self._prepare_epilogue_logit(
+                        sC[row_in_tile, n], mA.element_type
+                    )
+                    if target_id == local_vocab_id:
+                        logit = target_logit
+                    row_sum_exp += cute.math.exp(
+                        logit - row_max,
+                        fastmath=True,
+                    )
+        row_sum_exp += cute.arch.shuffle_sync_bfly(row_sum_exp, offset=1)
+
+        if lane_in_row == 0:
+            merged_max = cute.arch.fmax(running_max[0], row_max)
+            running_sum_exp[0] = running_sum_exp[0] * cute.math.exp(
+                running_max[0] - merged_max,
+                fastmath=True,
+            ) + row_sum_exp * cute.math.exp(
+                row_max - merged_max,
+                fastmath=True,
+            )
+            running_max[0] = merged_max
+            running_rank_count[0] += rank_count
+
+    @cute.jit
+    def _compute_vocab_block(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mTargetIds: cute.Tensor,
+        mTargetLogits: cute.Tensor,
+        valid_vocab_size: cutlass.Int32,
+        global_vocab_start: cutlass.Int32,
+        vocab_block: cutlass.Int32,
+        block_m: cutlass.Int32,
+        running_max: cute.Tensor,
+        running_sum_exp: cute.Tensor,
+        running_rank_count: cute.Tensor,
+        running_topk_values: cute.Tensor,
+        running_topk_ids: cute.Tensor,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        sC: cute.Tensor,
+        _sA_layout: cute.Layout,
+        _sA_swizzle: cute.Swizzle,
+        _sB_layout: cute.Layout,
+        _sB_swizzle: cute.Swizzle,
+        _sC_layout: cute.Layout,
+        tiled_copy_A: cute.TiledCopy,
+        tiled_copy_B: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+    ):
+        """Compute one vocabulary tile with SM90 warpgroup MMA."""
+        tidx, _, _ = cute.arch.thread_idx()
+        tiler_coord = (block_m, vocab_block, None)
+        cta_tiler = (self.tile_m, self.tile_n, self.tile_k)
+
+        gA = cute.local_tile(
+            mA,
+            tiler=cta_tiler,
+            coord=tiler_coord,
+            proj=(1, None, 1),
+        )
+        gB = cute.local_tile(
+            mB,
+            tiler=cta_tiler,
+            coord=tiler_coord,
+            proj=(None, 1, 1),
+        )
+        residual_k = mA.shape[1] - cutlass.Int32(self.tile_k) * gA.shape[2]
+        gA = cute.domain_offset((0, residual_k, 0), gA)
+        gB = cute.domain_offset((0, residual_k, 0), gB)
+        gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
+        gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
+
+        cA = cute.local_tile(
+            cute.make_identity_tensor(mA.layout.shape),
+            tiler=cta_tiler,
+            coord=tiler_coord,
+            proj=(1, None, 1),
+        )
+        cB = cute.local_tile(
+            cute.make_identity_tensor(mB.layout.shape),
+            tiler=cta_tiler,
+            coord=tiler_coord,
+            proj=(None, 1, 1),
+        )
+        cA = cute.domain_offset((0, residual_k, 0), cA)
+        cB = cute.domain_offset((0, residual_k, 0), cB)
+
+        thr_copy_A = tiled_copy_A.get_slice(tidx)
+        thr_copy_B = tiled_copy_B.get_slice(tidx)
+        tAgA = thr_copy_A.partition_S(gA)
+        tAsA = thr_copy_A.partition_D(sA)
+        tBgB = thr_copy_B.partition_S(gB)
+        tBsB = thr_copy_B.partition_D(sB)
+        tAcA = thr_copy_A.partition_S(cA)
+        tBcB = thr_copy_B.partition_S(cB)
+
+        tApA = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    tAgA.shape[0][1],
+                    cute.size(tAgA, mode=[1]),
+                    cute.size(tAgA, mode=[2]),
+                ),
+                stride=(cute.size(tAgA, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        tBpB = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    tBgB.shape[0][1],
+                    cute.size(tBgB, mode=[1]),
+                    cute.size(tBgB, mode=[2]),
+                ),
+                stride=(cute.size(tBgB, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        for rest_v in range(tApA.shape[0]):
+            for m in range(tApA.shape[1]):
+                tApA[rest_v, m, 0] = cute.elem_less(
+                    tAcA[(0, rest_v), m, 0, 0][0], mA.shape[0]
+                )
+        for rest_v in range(tBpB.shape[0]):
+            for n in range(tBpB.shape[1]):
+                tBpB[rest_v, n, 0] = cute.elem_less(
+                    tBcB[(0, rest_v), n, 0, 0][0], valid_vocab_size
+                )
+
+        # WGMMA reads A/B directly from shared-memory descriptors. Keep three
+        # cp.async stages in flight so the next tile load overlaps the current
+        # asynchronous warpgroup MMA.
+        tAsA.fill(0)
+        tBsB.fill(0)
+        cute.arch.sync_threads()
+        thr_mma = tiled_mma.get_slice(tidx)
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrB = tiled_mma.make_fragment_B(tCsB)
+        tCrC = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((self.tile_m, self.tile_n)),
+            cutlass.Float32,
+        )
+        tCrC.fill(0.0)
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        num_k_blocks = cute.size(tCrA, mode=[2])
+        num_smem_stages = cute.size(tAsA, mode=[3])
+        k_tile_count = cute.size(tAgA, mode=[3])
+        k_tile_index = cutlass.Int32(0)
+
+        # The residual K tile is shifted to the front and needs an elementwise
+        # K predicate. Every subsequent K tile is full width.
+        for k in range(tApA.shape[2]):
+            if cute.elem_less(cutlass.Int32(-1), tAcA[0, 0, k, 0][1]):
+                cute.copy(
+                    tiled_copy_A,
+                    tAgA[None, None, k, k_tile_index],
+                    tAsA[None, None, k, 0],
+                    pred=tApA[None, None, k],
+                )
+        for k in range(tBpB.shape[2]):
+            if cute.elem_less(cutlass.Int32(-1), tBcB[0, 0, k, 0][1]):
+                cute.copy(
+                    tiled_copy_B,
+                    tBgB[None, None, k, k_tile_index],
+                    tBsB[None, None, k, 0],
+                    pred=tBpB[None, None, k],
+                )
+        k_tile_index = k_tile_index + 1
+        cute.arch.cp_async_commit_group()
+
+        for stage in range(1, num_smem_stages - 1):
+            cute.copy(
+                tiled_copy_A,
+                tAgA[None, None, None, k_tile_index],
+                tAsA[None, None, None, stage],
+                pred=tApA,
+            )
+            cute.copy(
+                tiled_copy_B,
+                tBgB[None, None, None, k_tile_index],
+                tBsB[None, None, None, stage],
+                pred=tBpB,
+            )
+            k_tile_index = k_tile_index + 1
+            cute.arch.cp_async_commit_group()
+
+        smem_pipe_read = 0
+        smem_pipe_write = num_smem_stages - 1
+        for k_tile in range(k_tile_count):
+            cute.arch.cp_async_wait_group(num_smem_stages - 2)
+            cute.arch.sync_threads()
+
+            cute.nvgpu.warpgroup.fence()
+            for k_block in cutlass.range(num_k_blocks, unroll_full=True):
+                cute.gemm(
+                    tiled_mma,
+                    tCrC,
+                    tCrA[None, None, k_block, smem_pipe_read],
+                    tCrB[None, None, k_block, smem_pipe_read],
+                    tCrC,
+                )
+                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+            cute.nvgpu.warpgroup.commit_group()
+            # Keep the newest WGMMA group in flight. The preceding group's
+            # stage is now safe to recycle for the future cp.async load.
+            cute.nvgpu.warpgroup.wait_group(1)
+
+            if k_tile + num_smem_stages - 1 < k_tile_count:
+                cute.copy(
+                    tiled_copy_A,
+                    tAgA[None, None, None, k_tile_index],
+                    tAsA[None, None, None, smem_pipe_write],
+                    pred=tApA,
+                )
+                cute.copy(
+                    tiled_copy_B,
+                    tBgB[None, None, None, k_tile_index],
+                    tBsB[None, None, None, smem_pipe_write],
+                    pred=tBpB,
+                )
+            k_tile_index = k_tile_index + 1
+            cute.arch.cp_async_commit_group()
+            smem_pipe_write = smem_pipe_read
+            smem_pipe_read = smem_pipe_read + 1
+            if smem_pipe_read == num_smem_stages:
+                smem_pipe_read = 0
+
+        # A/B and C scratch are phase-disjoint in the shared allocation.
+        cute.nvgpu.warpgroup.wait_group(0)
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        tCsC = thr_mma.partition_C(sC)
+        cute.autovec_copy(tCrC, tCsC)
+        cute.arch.sync_threads()
+        if cutlass.const_expr(self.num_topk == 0):
+            self._update_stats_from_smem(
+                sC,
+                mA,
+                mTargetIds,
+                mTargetLogits,
+                valid_vocab_size,
+                vocab_block,
+                block_m,
+                running_max,
+                running_sum_exp,
+                running_rank_count,
+            )
+        else:
+            self._update_topk_warp_select_from_smem(
+                sC,
+                mA,
+                mTargetIds,
+                mTargetLogits,
+                valid_vocab_size,
+                global_vocab_start,
+                vocab_block,
+                block_m,
+                running_max,
+                running_sum_exp,
+                running_rank_count,
+                running_topk_values,
+                running_topk_ids,
+            )
+
+
 @cache
 def _compile_lm_head_logprobs(
     hidden_size: int,
@@ -1138,7 +1547,11 @@ def _compile_lm_head_logprobs(
     device_index: int,
     num_topk: int,
     group_n: int,
+    use_sm80: bool = False,
+    use_sm90: bool = False,
 ):
+    if use_sm80 and use_sm90:
+        raise ValueError("GPU specializations are mutually exclusive")
     _validate_device_environment(device_index)
     # Keep M symbolic so one compiled specialization serves all prompt chunks.
     num_rows = cute.sym_int()
@@ -1197,16 +1610,40 @@ def _compile_lm_head_logprobs(
             stride=(num_partials * num_topk, num_topk, 1),
             assumed_align=4,
         )
-    op = _LMHeadLogprobsCpAsync(
-        _TILE_M,
-        _TILE_N,
-        _TILE_K,
-        _NUM_STAGES,
-        _ATOM_LAYOUT_M,
-        _ATOM_LAYOUT_N,
-        num_topk,
-        group_n,
-    )
+    op: _LMHeadLogprobsCpAsync
+    if use_sm90:
+        op = _LMHeadLogprobsSm90(
+            64,
+            _TILE_N,
+            _TILE_K,
+            _NUM_STAGES,
+            4,
+            1,
+            num_topk,
+            group_n,
+        )
+    elif use_sm80:
+        op = _LMHeadLogprobsSm80(
+            _TILE_M,
+            _TILE_N,
+            _TILE_K,
+            _NUM_STAGES,
+            _ATOM_LAYOUT_M,
+            _ATOM_LAYOUT_N,
+            num_topk,
+            group_n,
+        )
+    else:
+        op = _LMHeadLogprobsCpAsync(
+            _TILE_M,
+            _TILE_N,
+            _TILE_K,
+            _NUM_STAGES,
+            _ATOM_LAYOUT_M,
+            _ATOM_LAYOUT_N,
+            num_topk,
+            group_n,
+        )
     return cute.compile(
         op,
         hidden,
