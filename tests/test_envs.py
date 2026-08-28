@@ -55,6 +55,71 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_v2_compact_prompt_logprobs_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", value)
+
+    assert envs.VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS is expected
+
+
+def test_v2_compact_prompt_logprobs_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", raising=False)
+    baseline_factors = envs.compile_factors()
+    monkeypatch.setenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", "1")
+    optimized_factors = envs.compile_factors()
+
+    assert "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS" not in optimized_factors
+    assert optimized_factors == baseline_factors
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        ("fused", "fused"),
+        ("materialized", "materialized"),
+    ],
+)
+def test_v2_compact_prompt_logprobs_backend_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: str,
+) -> None:
+    name = "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert expected == envs.VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND
+
+
+def test_v2_compact_prompt_logprobs_backend_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND"
+    monkeypatch.setenv(name, "auto")
+    auto_factors = envs.compile_factors()
+    monkeypatch.setenv(name, "fused")
+    fused_factors = envs.compile_factors()
+
+    assert name not in fused_factors
+    assert fused_factors == auto_factors
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")

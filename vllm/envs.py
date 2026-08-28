@@ -299,6 +299,10 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS: bool = False
+    VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND: Literal[
+        "auto", "fused", "materialized"
+    ] = "auto"
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2056,6 +2060,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # Experimental compact prompt-logprobs path for the v2 model runner.
+    "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS": lambda: bool(
+        int(os.getenv("VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS", "0"))
+    ),
+    "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND": env_with_choices(
+        "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND",
+        "auto",
+        ["auto", "fused", "materialized"],
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2270,6 +2283,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        # Selects the post-forward prompt-logprobs worker and does not affect
+        # the compiled model graph. Keeping it in the key needlessly compiles
+        # a second backbone for baseline/optimized comparisons.
+        "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS",
+        "VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

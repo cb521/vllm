@@ -1,22 +1,257 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import Literal
 
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config.model import LogprobsMode
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
+_AUTO_MATERIALIZED_WORKSPACE_LIMIT_BYTES = 256 * 1024 * 1024
+_CompactBackend = Literal["auto", "fused", "materialized"]
+_ChunkBackend = Literal["native", "fused", "materialized"]
+
+
+def _is_h20_device_name(device_name: str) -> bool:
+    """Match H20 variants without also matching H200."""
+    device_tokens = device_name.upper().replace("-", " ").replace("_", " ").split()
+    return "H20" in device_tokens
+
+
+def _is_a100_device_name(device_name: str) -> bool:
+    """Match A100 PCIe/SXM variants without matching similarly named GPUs."""
+    device_tokens = device_name.upper().replace("-", " ").replace("_", " ").split()
+    return "A100" in device_tokens
+
+
+def _select_auto_chunk_backend(
+    *,
+    device_name: str,
+    tp_size: int,
+    num_rows: int,
+    num_logprobs: int,
+    local_vocab_size: int,
+    element_size: int,
+    materialized_workspace_limit_bytes: int = (
+        _AUTO_MATERIALIZED_WORKSPACE_LIMIT_BYTES
+    ),
+) -> _ChunkBackend:
+    """Select a measured fast path while bounding local-logits workspace.
+
+    Crossover points come from architecture-specific Qwen3.5-27B H=5120,
+    V=248320 sweeps. H20 and A100 use independent profiles; other architectures
+    retain the fused default until their own measurements are available.
+    """
+    if tp_size <= 1:
+        return "native"
+
+    is_h20 = _is_h20_device_name(device_name)
+    is_a100 = _is_a100_device_name(device_name)
+    if not is_h20 and not is_a100:
+        return "fused"
+
+    materialized_workspace_bytes = num_rows * local_vocab_size * element_size
+    if materialized_workspace_bytes > materialized_workspace_limit_bytes:
+        return "fused"
+
+    if is_h20:
+        if num_logprobs == 0:
+            min_materialized_rows = 1 if tp_size <= 2 else 8 if tp_size <= 4 else 32
+        else:
+            min_materialized_rows = 2 if tp_size <= 2 else 32 if tp_size <= 4 else 64
+        if num_rows < min_materialized_rows:
+            return "native"
+        return "materialized"
+
+    # A100 SM80 uses a vocabulary-major fused kernel. Top-K still benefits from
+    # the platform BF16 GEMM at the measured multi-GPU chunk sizes, while K=0
+    # crosses back to fused sooner as each rank owns more vocabulary columns.
+    if tp_size not in (2, 4, 8):
+        return "fused"
+    if num_rows < 256:
+        return "fused"
+    if tp_size == 8:
+        # Prompt logprobs are currently chunked at 1024 rows.  The measured
+        # TP8 A100 sweep favors materialized for K=0/20/32 throughout the
+        # production 256/512/1024-row range.  Keep larger, currently
+        # unreachable chunks on the conservative fused path until measured.
+        return "materialized" if num_rows <= 1024 else "fused"
+    if num_logprobs > 0:
+        return "materialized"
+    min_fused_rows = 512 if tp_size == 2 else 1024
+    return "fused" if num_rows >= min_fused_rows else "materialized"
+
+
+class CompactPromptLogprobs:
+    """Model-owned components for an adaptive prompt-logprobs path."""
+
+    def __init__(
+        self,
+        logits_processor: LogitsProcessor,
+        lm_head: VocabParallelEmbedding,
+        backend: _CompactBackend = "fused",
+        *,
+        materialized_workspace_limit_bytes: int = (
+            _AUTO_MATERIALIZED_WORKSPACE_LIMIT_BYTES
+        ),
+    ) -> None:
+        if materialized_workspace_limit_bytes < 0:
+            raise ValueError("materialized workspace limit must be non-negative")
+        self._logits_processor = logits_processor
+        self._lm_head = lm_head
+        self._backend = backend
+        self._materialized_workspace_limit_bytes = materialized_workspace_limit_bytes
+        self._device_name: str | None = None
+        self._local_vocab_size = 0
+        self._weight_element_size = 0
+        weight = getattr(lm_head, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            self._local_vocab_size = weight.shape[0]
+            self._weight_element_size = weight.element_size()
+            if weight.is_cuda:
+                device_index = weight.device.index
+                if device_index is None:
+                    device_index = torch.accelerator.current_device_index()
+                self._device_name = current_platform.get_device_name(device_index)
+
+    def select_backend(self, num_rows: int, num_logprobs: int) -> _ChunkBackend:
+        """Return the implementation selected for one prompt chunk."""
+        if self._backend == "fused":
+            return "fused"
+        if self._backend == "materialized":
+            if self._lm_head.tp_size <= 1:
+                return "native"
+            # Preserve the conservative forced-materialized tail fallback on
+            # devices without an auto profile.
+            min_rows = 64 if self._lm_head.tp_size == 2 else 256
+            return "materialized" if num_rows >= min_rows else "native"
+        if self._lm_head.tp_size <= 1:
+            return "native"
+        if self._device_name is None:
+            return "fused"
+        return _select_auto_chunk_backend(
+            device_name=self._device_name,
+            tp_size=self._lm_head.tp_size,
+            num_rows=num_rows,
+            num_logprobs=num_logprobs,
+            local_vocab_size=self._local_vocab_size,
+            element_size=self._weight_element_size,
+            materialized_workspace_limit_bytes=(
+                self._materialized_workspace_limit_bytes
+            ),
+        )
+
+    def compute(
+        self,
+        hidden_states: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        num_logprobs: int,
+    ) -> LogprobsTensors:
+        """Compute one chunk without gathering full-vocabulary logits."""
+        backend = self.select_backend(hidden_states.shape[0], num_logprobs)
+        if backend == "native":
+            raise RuntimeError("native prompt logprobs must use the logits callback")
+        compute_fn = (
+            self._logits_processor.get_materialized_prompt_logprobs
+            if backend == "materialized"
+            else self._logits_processor.get_prompt_logprobs
+        )
+        token_ids, logprobs, ranks = compute_fn(
+            self._lm_head,
+            hidden_states,
+            target_token_ids,
+            num_logprobs,
+        )
+        return LogprobsTensors(
+            logprob_token_ids=token_ids,
+            logprobs=logprobs,
+            selected_token_ranks=ranks,
+        )
+
+    def supports_chunk(self, num_rows: int, num_logprobs: int) -> bool:
+        """Return whether the selected backend is faster for this chunk."""
+        return self.select_backend(num_rows, num_logprobs) != "native"
+
+    def warmup(self) -> None:
+        """Compile compact prompt-logprobs kernels."""
+        # Chunking is currently capped at 1024 rows. Warm every implementation
+        # that auto dispatch can reach within that domain, but no others.
+        candidate_backends = {
+            self.select_backend(num_rows, num_logprobs)
+            for num_rows in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+            for num_logprobs in (0, 32)
+        }
+        if "fused" in candidate_backends:
+            self._logits_processor.warmup_prompt_logprobs(self._lm_head)
+        if "materialized" in candidate_backends:
+            self._logits_processor.warmup_materialized_prompt_logprobs(self._lm_head)
+
+
+def init_compact_prompt_logprobs(
+    model: torch.nn.Module,
+    hidden_dtype: torch.dtype,
+    logprobs_mode: LogprobsMode,
+) -> CompactPromptLogprobs:
+    """Resolve and validate model components used by the compact path."""
+    if logprobs_mode != "raw_logprobs":
+        raise RuntimeError(
+            "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS requires raw_logprobs mode"
+        )
+
+    # Multimodal wrappers expose their text decoder through this protocol.
+    language_model = (
+        model.get_language_model() if hasattr(model, "get_language_model") else model
+    )
+    logits_processor: LogitsProcessor | None = getattr(
+        language_model, "logits_processor", None
+    )
+    lm_head: VocabParallelEmbedding | None = getattr(language_model, "lm_head", None)
+    if (
+        logits_processor is None
+        or lm_head is None
+        or not hasattr(logits_processor, "validate_prompt_logprobs")
+    ):
+        raise RuntimeError(
+            "VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS requires a model with "
+            "a standard LM head and LogitsProcessor"
+        )
+
+    try:
+        logits_processor.validate_prompt_logprobs(lm_head, hidden_dtype)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"VLLM_USE_V2_COMPACT_PROMPT_LOGPROBS is unsupported by this model: {exc}"
+        ) from exc
+
+    return CompactPromptLogprobs(
+        logits_processor,
+        lm_head,
+        envs.VLLM_V2_COMPACT_PROMPT_LOGPROBS_BACKEND,
+    )
+
 
 class PromptLogprobsWorker:
-    def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        compact_prompt_logprobs: CompactPromptLogprobs | None = None,
+    ) -> None:
         self.max_num_reqs = max_num_reqs
         self.logprobs_mode = logprobs_mode
+        self._compact_prompt_logprobs = compact_prompt_logprobs
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -85,6 +320,12 @@ class PromptLogprobsWorker:
                 logits_fn,
                 max_num_prompt_logprobs,
                 self.logprobs_mode,
+                self._compact_prompt_logprobs.compute
+                if self._compact_prompt_logprobs is not None
+                else None,
+                self._compact_prompt_logprobs.supports_chunk
+                if self._compact_prompt_logprobs is not None
+                else None,
             )
         )
 
@@ -202,7 +443,21 @@ def compute_prompt_logprobs_with_chunking(
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
     logprobs_mode: LogprobsMode = "raw_logprobs",
+    compact_prompt_logprobs_fn: (
+        Callable[[torch.Tensor, torch.Tensor, int], LogprobsTensors] | None
+    ) = None,
+    compact_prompt_logprobs_predicate: Callable[[int, int], bool] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if compact_prompt_logprobs_fn is not None:
+        if logprobs_mode != "raw_logprobs":
+            raise ValueError(
+                "compact prompt logprobs require logprobs_mode='raw_logprobs'"
+            )
+        if not 0 <= num_prompt_logprobs <= 32:
+            # All rows in a batch share one K. Fall back for the whole batch
+            # when any request needs semantics unsupported by the compact path.
+            compact_prompt_logprobs_fn = None
+
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
     CHUNK_SIZE = 1024
@@ -213,19 +468,35 @@ def compute_prompt_logprobs_with_chunking(
     prompt_token_ids = prompt_token_ids.to(torch.int64)
     for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
         end_idx = start_idx + CHUNK_SIZE
-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
-        requested_num = (
-            prompt_logits.shape[-1]
-            if num_prompt_logprobs == -1
-            else num_prompt_logprobs
+        chunk_hidden_states = prompt_hidden_states[start_idx:end_idx]
+        chunk_token_ids = prompt_token_ids[start_idx:end_idx]
+        use_compact = compact_prompt_logprobs_fn is not None and (
+            compact_prompt_logprobs_predicate is None
+            or compact_prompt_logprobs_predicate(
+                chunk_hidden_states.shape[0], num_prompt_logprobs
+            )
         )
-        result = compute_topk_scores(
-            prompt_logits,
-            requested_num,
-            prompt_token_ids[start_idx:end_idx],
-            logits_mode=logits_mode,
-        )
+        if use_compact:
+            assert compact_prompt_logprobs_fn is not None
+            result = compact_prompt_logprobs_fn(
+                chunk_hidden_states,
+                chunk_token_ids,
+                num_prompt_logprobs,
+            )
+        else:
+            # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+            prompt_logits = logits_fn(chunk_hidden_states)
+            requested_num = (
+                prompt_logits.shape[-1]
+                if num_prompt_logprobs == -1
+                else num_prompt_logprobs
+            )
+            result = compute_topk_scores(
+                prompt_logits,
+                requested_num,
+                chunk_token_ids,
+                logits_mode=logits_mode,
+            )
         token_ids.append(result.logprob_token_ids)
         scores.append(result.logprobs)
         ranks.append(result.selected_token_ranks)
