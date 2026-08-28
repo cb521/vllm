@@ -5,23 +5,24 @@ H20 上比较了四条路径：vLLM 原生、原 PR fused、新 fused 和 materi
 
 ## Kernel 实现
 
-H20 走 SM90 WGMMA CuTeDSL Kernel。LM Head 计算时顺手完成 LSE、目标 Token 的
-Rank 和 local Top-K，不再另外生成完整的 FP32 Logprobs。更适合平台 GEMM 的形状
-走 materialized：先用 BF16 GEMM 生成 TP-local Logits，再用 Triton 做 LSE 和
-Rank 归约。
-
-各 TP Rank 只产出局部结果，最后由一个 Triton Kernel 合并 LSE、Rank 和 Top-K
-候选，并算出最终 Logprob。
+- fused 路径把 TP-local LM Head、local LSE、目标 Token Rank 统计和 local Top-K
+  合到一个 SM90 WGMMA CuTeDSL Kernel。
+- materialized 路径保留 BF16 GEMM，生成 TP-local Logits；后面的 local LSE 和
+  Rank 统计合到一个 Triton Kernel，local Top-K 单独计算。
+- TP 合并阶段把 global LSE、Rank 求和、Top-K 合并和 Logprob 归一化放到一个
+  Triton Kernel。
+- 目标 Token Logit 单独用 BF16 batched GEMM 计算，与 vLLM 原生 LM Head 的结果
+  对齐。
 
 ## vLLM 接入
 
-接入点放在 Hidden States 输出之后、完整词表 Logits AllGather 之前。这里直接拿
-Hidden States 和目标 Token ID 计算，所以 TP Rank 之间只需要交换目标值、LSE、
-Rank 和 Top-K 候选。目标 Token Logit 仍用 BF16 batched GEMM，数值行为与 vLLM
-原生 LM Head 一致。
-
-每个 Chunk 根据 GPU、TP、行数、K 和 256 MiB 临时显存上限选择 native、fused
-或 materialized。初始化时会做一次正确性检查，并提前预热要用到的 Kernel。
+- `model_runner.py` 把 Hidden States 直接交给 Prompt Logprobs，不再先生成并
+  AllGather 完整词表 Logits。
+- `prompt_logprob.py` 增加按 Chunk 的 native、fused、materialized 路由；选择条件
+  包括 GPU、TP、行数、K 和 256 MiB 临时显存上限。
+- `logits_processor.py` 增加 TP-local 计算和 compact AllGather。卡间只传目标值、
+  LSE、Rank 和 Top-K 候选，最终输出格式保持不变。
+- 初始化时检查 LM Head 和数据类型，并预热会用到的 Kernel。
 
 ## 测试配置
 
@@ -34,27 +35,20 @@ Rank 和 Top-K 候选。目标 Token Logit 仍用 BF16 batched GEMM，数值行�
 - 每个测试点：预热 1 次，正式测试 3 次，取中位数
 - 基线：相同模型、Prompt、硬件和 TP 配置下的 vLLM 原生实现
 
-## 核心算子
+## Benchmark
 
 核心算子一共 15 个测试点：TP2/4/8 × Prompt 1K/4K/8K/16K/32K，K 固定为 20。
 四条路径共用同一份输入，误差直接对 PyTorch。这里的“vLLM 原生”是完整词表
 Logits 加 FP32 `log_softmax` 的原生计算方式。一个单元格里有三个数字时，顺序为
 TP2 / TP4 / TP8。
 
-| 评价维度 | 核心指标 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Logprobs 数值正确性 | 最大绝对误差 | 0 | 1.567e-2 | 1.907e-6 | 1.907e-6 |
-| Logprobs 数值正确性 | 各测试点平均绝对误差的最大值 | 0 | 1.646e-3 | 2.9e-7 | 3.0e-7 |
-| 峰值显存占用 | 单卡临时峰值（全矩阵最大） | 85367.9 MiB | 1069.2 MiB | 1067.7 MiB | 7929.7 MiB |
-| 峰值显存占用 | 相对原生降低范围 | — | 98.69%–99.68% | 98.75%–99.61% | 90.71%–97.64% |
-| 跨卡通信开销 | 每卡通信量（全矩阵最大） | 7760 MiB | 5.375 MiB | 5.375 MiB | 5.375 MiB |
-| 跨卡通信开销 | 相对原生降低范围 | — | 99.723%–99.931% | 99.723%–99.931% | 99.723%–99.931% |
-| 跨卡通信开销 | 通信耗时几何平均加速 | 1.00x | 201.12x | 198.64x | 198.64x |
-| 设备负载均衡 | 多卡计算耗时差（全矩阵最大） | 0.034% | 0.021% | 0.035% | 0.030% |
-| 设备负载均衡 | 多卡峰值显存差（全矩阵最大） | 0 MiB | 0 MiB | 0 MiB | 0 MiB |
-| Prompt 推理吞吐 | 32K Logprobs 耗时（ms） | 651.96 / 513.46 / 444.10 | 529.74 / 265.88 / 134.40 | 459.01 / 230.54 / 116.73 | 361.23 / 177.40 / 89.71 |
-| Prompt 推理吞吐 | 32K 吞吐（tokens/s） | 50,261 / 63,819 / 73,785 | 61,857 / 123,244 / 243,809 | 71,388 / 142,138 / 280,714 | 90,713 / 184,715 / 365,253 |
-| Prompt 推理吞吐 | 相对原生加速（几何平均；范围） | 1.000x | 1.911x；1.180x–3.310x | 2.246x；1.391x–3.821x | 2.920x；1.797x–5.001x |
+| 评价维度 | 统计口径 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
+| --- | --- | --- | --- | --- | --- |
+| Logprobs 数值正确性 | 最大绝对误差；各测试点平均绝对误差的最大值 | 最大 0<br>平均 0 | 最大 1.567e-2<br>平均 1.646e-3 | 最大 1.907e-6<br>平均 2.9e-7 | 最大 1.907e-6<br>平均 3.0e-7 |
+| 峰值显存占用 | 全矩阵单卡临时峰值；相对原生降低范围 | 85367.9 MiB | 1069.2 MiB<br>降低 98.69%–99.68% | 1067.7 MiB<br>降低 98.75%–99.61% | 7929.7 MiB<br>降低 90.71%–97.64% |
+| 跨卡通信开销 | 全矩阵最大每卡通信量；相对原生降低；通信耗时几何平均加速 | 7760 MiB<br>1.00x | 5.375 MiB<br>降低 99.723%–99.931%<br>201.12x | 5.375 MiB<br>降低 99.723%–99.931%<br>198.64x | 5.375 MiB<br>降低 99.723%–99.931%<br>198.64x |
+| 设备负载均衡 | 全矩阵最大多卡计算耗时差；最大多卡峰值显存差 | 耗时差 0.034%<br>显存差 0 MiB | 耗时差 0.021%<br>显存差 0 MiB | 耗时差 0.035%<br>显存差 0 MiB | 耗时差 0.030%<br>显存差 0 MiB |
+| Prompt 推理吞吐 | 32K Logprobs 耗时、吞吐（TP2 / TP4 / TP8）；全矩阵加速 | 651.96 / 513.46 / 444.10 ms<br>50,261 / 63,819 / 73,785 tokens/s<br>1.000x | 529.74 / 265.88 / 134.40 ms<br>61,857 / 123,244 / 243,809 tokens/s<br>1.911x（1.180x–3.310x） | 459.01 / 230.54 / 116.73 ms<br>71,388 / 142,138 / 280,714 tokens/s<br>2.246x（1.391x–3.821x） | 361.23 / 177.40 / 89.71 ms<br>90,713 / 184,715 / 365,253 tokens/s<br>2.920x（1.797x–5.001x） |
 
 原 PR 虽然快，也省显存，但误差到了 `1e-2`，正确性不过关。两条新路径的最大误差
 都是 `1.907e-6`。其中 fused 占用的临时显存更少，materialized 更快。
