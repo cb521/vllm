@@ -1,30 +1,27 @@
 # A100 Prompt Logprobs 对比报告
 
-A100 的数值、显存和通信量已经测清楚，完整模型也看到了加速。需要单独说明的是，
-测试节点的 NCCL 直连有故障，因此通信耗时不能作为验收结果；完整模型也有一部分
-数据换过机器，表里会单独标出。
+A100 这次有两个限制：测试节点的 NCCL 直连坏了，通信只能走 socket；部分整模型
+数据也换过机器。因此通信耗时不作结论，整模型是否同卡会在表里标出来。
 
 ## Kernel 实现
 
-A100 使用针对 SM80 的 `mma.sync` CuTeDSL Kernel，并按词表维度优先调度 CTA。
-它在计算 TP-local LM Head 的同时，完成 LSE、目标 Token 的 Rank 和 local Top-K 统计，
-不再单独生成完整的 FP32 Logprobs。对于更适合平台 GEMM 的形状，materialized
-路径先用 BF16 GEMM 生成 TP-local Logits，再由一个 Triton Kernel 完成 LSE 和
-Rank 归约。
+A100 走 SM80 `mma.sync` CuTeDSL Kernel，CTA 优先沿词表维度调度。LM Head 计算
+时顺手完成 LSE、目标 Token 的 Rank 和 local Top-K，不再另外生成完整的 FP32
+Logprobs。更适合平台 GEMM 的形状走 materialized：先用 BF16 GEMM 生成 TP-local
+Logits，再用 Triton 做 LSE 和 Rank 归约。
 
-各 TP Rank 算完后，最后一个 Triton Kernel 负责合并 LSE、Rank 和 Top-K 候选，
-并计算归一化后的 Logprob。
+各 TP Rank 只产出局部结果，最后由一个 Triton Kernel 合并 LSE、Rank 和 Top-K
+候选，并算出最终 Logprob。
 
 ## vLLM 接入
 
-Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕过原生路径的
-完整词表 Logits AllGather。TP Rank 之间只交换目标值、LSE、Rank 和 Top-K 候选。
-目标 Token Logit 仍使用 BF16 batched GEMM，和 vLLM 原生 LM Head 的数值语义保持
-一致。
+接入点放在 Hidden States 输出之后、完整词表 Logits AllGather 之前。这里直接拿
+Hidden States 和目标 Token ID 计算，所以 TP Rank 之间只需要交换目标值、LSE、
+Rank 和 Top-K 候选。目标 Token Logit 仍用 BF16 batched GEMM，数值行为与 vLLM
+原生 LM Head 一致。
 
-每个 Chunk 会根据 GPU、TP、行数、K 和 256 MiB 临时显存上限，在 native、fused
-和 materialized 三条路径中选择合适的一条。启动时会先做正确性检查和 Kernel 预热，
-避免把首次编译算进正式请求。
+每个 Chunk 根据 GPU、TP、行数、K 和 256 MiB 临时显存上限选择 native、fused
+或 materialized。初始化时会做一次正确性检查，并提前预热要用到的 Kernel。
 
 ## 测试配置
 
@@ -33,21 +30,22 @@ Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕�
 - TP：2、4、8
 - Batch size：1
 - Prompt：1K、4K、8K、16K、32K
-- Prompt Logprobs K：0、20；本文主表使用 K=20
+- Prompt Logprobs K：0、20；主表使用 K=20
 - 每个测试点：预热 1 次，正式测试 3 次，取中位数
 - 基线：相同模型、Prompt 和 TP 配置下的 vLLM 原生实现
 
-## 四种实现的核心对比
+## 核心算子
 
-下面是 TP2/4/8、Prompt 1K/4K/8K/16K/32K、K=20 的同输入测试。核心测试中的
-“vLLM 原生”使用和原生路径相同的完整词表 Logits、FP32 Log Softmax 参考实现；
-误差统一与 PyTorch 结果比较。A100 上该参考实现在 32K 会超过 80 GiB，因此四列
-都能直接对齐的长上下文数据取 16K。表内三组数字的顺序都是 TP2 / TP4 / TP8。
+核心算子一共 15 个测试点：TP2/4/8 × Prompt 1K/4K/8K/16K/32K，K 固定为 20。
+四条路径共用同一份输入，误差直接对 PyTorch。这里的“vLLM 原生”是完整词表
+Logits 加 FP32 `log_softmax` 的原生计算方式。它在 A100 80GB 上跑不了 32K，所以
+四列都能对齐的长上下文数据用 16K。一个单元格里有三个数字时，顺序为
+TP2 / TP4 / TP8。
 
-| 评价维度 | 核心指标 | vLLM 原生 | 原 PR fused | 当前 fused | 当前 materialized |
+| 评价维度 | 核心指标 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
 | --- | --- | --- | --- | --- | --- |
 | Logprobs 数值正确性 | 最大绝对误差 | 0 | 1.565e-2 | 1.907e-6 | 1.907e-6 |
-| Logprobs 数值正确性 | 平均绝对误差（各点中的最大值） | 0 | 1.634e-3 | 2.757e-7 | 2.943e-7 |
+| Logprobs 数值正确性 | 各测试点平均绝对误差的最大值 | 0 | 1.634e-3 | 2.757e-7 | 2.943e-7 |
 | 峰值显存占用 | 16K 单卡临时峰值（MiB） | 42683.9 / 42683.9 / 42683.9 | 533.8 / 268.6 / 138.3 | 350.8 / 192.4 / 192.4 | 3891.0 / 1956.2 / 996.5 |
 | 峰值显存占用 | 相对原生降低 | — | 98.75% / 99.37% / 99.68% | 99.18% / 99.55% / 99.55% | 90.88% / 95.42% / 97.67% |
 | 跨卡通信开销 | 16K 每卡通信量（MiB） | 3880 / 1940 / 970 | 2.688 / 2.688 / 2.688 | 2.688 / 2.688 / 2.688 | 2.688 / 2.688 / 2.688 |
@@ -59,16 +57,16 @@ Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕�
 | Prompt 推理吞吐 | 16K 吞吐（tokens/s）* | 1,739 / 1,108 / 899 | 107,403 / 180,288 / 193,589 | 113,902 / 188,855 / 198,801 | 142,711 / 229,213 / 218,517 |
 | Prompt 推理吞吐 | 相对原生加速* | 1.00x | 61.77x / 162.78x / 215.23x | 65.51x / 170.51x / 221.02x | 82.07x / 206.95x / 242.94x |
 
-带 `*` 的三行被 socket collective 严重影响，只保留原始观测值，不能当作健康
-A100 集群上的加速比。通信数据量、显存和正确性不受这项故障影响。原 PR 的误差在
-`1e-2` 量级；当前 fused 和 materialized 的最大误差均为 `1.907e-6`。
+带 `*` 的三行主要是在测 socket，不能拿来代表正常 A100 的速度。通信数据量、显存
+和正确性不受影响。原 PR 的误差到了 `1e-2`；两条新路径的最大误差都是
+`1.907e-6`。
 
 ## 完整模型对比
 
-下表是 Qwen3.5-27B、Batch 1、K=20 的 15 个测试点。四条路径分别强制运行，PR
-默认的自动选择器不作为第五列。
+整模型使用 Qwen3.5-27B、Batch 1、K=20，同样跑 15 个测试点。这里强制跑四条路径，
+默认的自动选择器不单独占一列。
 
-| 核心指标 | vLLM 原生 | 原 PR fused | 当前 fused | 当前 materialized |
+| 核心指标 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
 | --- | ---: | ---: | ---: | ---: |
 | Prompt 吞吐几何平均加速 | 1.000x | 1.153x | 1.163x | 1.160x |
 | TP2 / TP4 / TP8 几何平均加速 | 1.000x / 1.000x / 1.000x | 1.179x / 1.186x / 1.095x | 1.181x / 1.197x / 1.113x | 1.199x / 1.199x / 1.084x |
@@ -78,15 +76,14 @@ A100 集群上的加速比。通信数据量、显存和正确性不受这项故
 | 32K 相对原生显存降低 | — | 1.54% / 2.61% / 2.99% | 1.54% / 2.61% / 2.99% | 1.87% / 2.70% / 2.94% |
 | 与原生使用同一物理 GPU 的测试点 | 15/15 | 5/15 | 10/15 | 10/15 |
 
-完整模型确实观察到了加速，但只有最后一行标出的测试点是同卡对比，TP8 全部换过
-机器，不能把所有差值都归因到 Kernel。两个独立 vLLM 进程之间连 native-vs-native
-分数也不能稳定复现，因此完整模型只用于看吞吐和显存；数值正确性以上面的同输入
-核心测试为准。
+整模型有加速，但不是每组数据都在同一批卡上跑的，TP8 更是全部换过机器，所以不能
+把差值全算到 Kernel 头上。另外，两个独立 vLLM 进程跑 native-vs-native 时，分数
+本身也不能稳定复现。整模型这里只看吞吐和显存，正确性看上面的同输入测试。
 
 ## 测试范围和原始数据
 
-这份结论只覆盖 Qwen3.5-27B、Batch 1、K≤20、TP2/4/8 和 A100 80GB PCIe。
-正式汇总和包含 353 项的 SHA256 manifest 在：
+目前只测了 Qwen3.5-27B、Batch 1、K≤20、TP2/4/8 和 A100 80GB PCIe。正式汇总和
+包含 353 项的 SHA256 manifest 在：
 
 ```text
 /home/scratch.binc_gpu_1/prompt-logprobs-a100-20260825/

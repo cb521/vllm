@@ -1,28 +1,27 @@
 # H20 Prompt Logprobs 对比报告
 
-H20 的正式测试已经跑完。以下数据都以相同模型、相同硬件和相同 TP 配置下的
-vLLM 原生 Prompt Logprobs 为基线。
+H20 上比较了四条路径：vLLM 原生、原 PR fused、新 fused 和 materialized。所有
+性能数据都来自同一个模型、同一台 H20 节点和相同的 TP 配置。
 
 ## Kernel 实现
 
-H20 使用针对 SM90 的 WGMMA CuTeDSL Kernel。它在计算 TP-local LM Head 的同时，
-完成 LSE、目标 Token 的 Rank 和 local Top-K 统计，不再单独生成完整的 FP32
-Logprobs。对于更适合平台 GEMM 的形状，materialized 路径先用 BF16 GEMM 生成
-TP-local Logits，再由一个 Triton Kernel 完成 LSE 和 Rank 归约。
+H20 走 SM90 WGMMA CuTeDSL Kernel。LM Head 计算时顺手完成 LSE、目标 Token 的
+Rank 和 local Top-K，不再另外生成完整的 FP32 Logprobs。更适合平台 GEMM 的形状
+走 materialized：先用 BF16 GEMM 生成 TP-local Logits，再用 Triton 做 LSE 和
+Rank 归约。
 
-各 TP Rank 算完后，最后一个 Triton Kernel 负责合并 LSE、Rank 和 Top-K 候选，
-并计算归一化后的 Logprob。
+各 TP Rank 只产出局部结果，最后由一个 Triton Kernel 合并 LSE、Rank 和 Top-K
+候选，并算出最终 Logprob。
 
 ## vLLM 接入
 
-Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕过原生路径的
-完整词表 Logits AllGather。TP Rank 之间只交换目标值、LSE、Rank 和 Top-K 候选。
-目标 Token Logit 仍使用 BF16 batched GEMM，和 vLLM 原生 LM Head 的数值语义保持
-一致。
+接入点放在 Hidden States 输出之后、完整词表 Logits AllGather 之前。这里直接拿
+Hidden States 和目标 Token ID 计算，所以 TP Rank 之间只需要交换目标值、LSE、
+Rank 和 Top-K 候选。目标 Token Logit 仍用 BF16 batched GEMM，数值行为与 vLLM
+原生 LM Head 一致。
 
-每个 Chunk 会根据 GPU、TP、行数、K 和 256 MiB 临时显存上限，在 native、fused
-和 materialized 三条路径中选择合适的一条。启动时会先做正确性检查和 Kernel 预热，
-避免把首次编译算进正式请求。
+每个 Chunk 根据 GPU、TP、行数、K 和 256 MiB 临时显存上限选择 native、fused
+或 materialized。初始化时会做一次正确性检查，并提前预热要用到的 Kernel。
 
 ## 测试配置
 
@@ -31,20 +30,21 @@ Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕�
 - TP：2、4、8
 - Batch size：1
 - Prompt：1K、4K、8K、16K、32K
-- Prompt Logprobs K：0、20；本文主表使用 K=20
+- Prompt Logprobs K：0、20；主表使用 K=20
 - 每个测试点：预热 1 次，正式测试 3 次，取中位数
 - 基线：相同模型、Prompt、硬件和 TP 配置下的 vLLM 原生实现
 
-## 四种实现的核心对比
+## 核心算子
 
-下面是 TP2/4/8、Prompt 1K/4K/8K/16K/32K、K=20 的同输入测试。核心测试中的
-“vLLM 原生”使用和原生路径相同的完整词表 Logits、FP32 Log Softmax 参考实现；
-误差统一与 PyTorch 结果比较。表内写成三组数字时，顺序都是 TP2 / TP4 / TP8。
+核心算子一共 15 个测试点：TP2/4/8 × Prompt 1K/4K/8K/16K/32K，K 固定为 20。
+四条路径共用同一份输入，误差直接对 PyTorch。这里的“vLLM 原生”是完整词表
+Logits 加 FP32 `log_softmax` 的原生计算方式。一个单元格里有三个数字时，顺序为
+TP2 / TP4 / TP8。
 
-| 评价维度 | 核心指标 | vLLM 原生 | 原 PR fused | 当前 fused | 当前 materialized |
+| 评价维度 | 核心指标 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Logprobs 数值正确性 | 最大绝对误差 | 0 | 1.567e-2 | 1.907e-6 | 1.907e-6 |
-| Logprobs 数值正确性 | 平均绝对误差（15 点中的最大值） | 0 | 1.646e-3 | 2.9e-7 | 3.0e-7 |
+| Logprobs 数值正确性 | 各测试点平均绝对误差的最大值 | 0 | 1.646e-3 | 2.9e-7 | 3.0e-7 |
 | 峰值显存占用 | 单卡临时峰值（全矩阵最大） | 85367.9 MiB | 1069.2 MiB | 1067.7 MiB | 7929.7 MiB |
 | 峰值显存占用 | 相对原生降低范围 | — | 98.69%–99.68% | 98.75%–99.61% | 90.71%–97.64% |
 | 跨卡通信开销 | 每卡通信量（全矩阵最大） | 7760 MiB | 5.375 MiB | 5.375 MiB | 5.375 MiB |
@@ -56,19 +56,18 @@ Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕�
 | Prompt 推理吞吐 | 32K 吞吐（tokens/s） | 50,261 / 63,819 / 73,785 | 61,857 / 123,244 / 243,809 | 71,388 / 142,138 / 280,714 | 90,713 / 184,715 / 365,253 |
 | Prompt 推理吞吐 | 相对原生加速（几何平均；范围） | 1.000x | 1.911x；1.180x–3.310x | 2.246x；1.391x–3.821x | 2.920x；1.797x–5.001x |
 
-原 PR 的速度和显存都不错，但误差在 `1e-2` 量级，不能通过正确性验收。当前 fused
-和 materialized 的最大误差都在 `1.907e-6`；fused 更省临时显存，materialized
-速度更快。
+原 PR 虽然快，也省显存，但误差到了 `1e-2`，正确性不过关。两条新路径的最大误差
+都是 `1.907e-6`。其中 fused 占用的临时显存更少，materialized 更快。
 
 ## 完整模型对比
 
-下表是 Qwen3.5-27B、Batch 1、K=20 的 15 个测试点。这里的第一列是真正的 vLLM
-原生实现，吞吐加速比按 `原生总耗时 / 当前总耗时` 计算。
+整模型使用 Qwen3.5-27B、Batch 1、K=20，同样跑 15 个测试点。这里的第一列是
+真正的 vLLM 原生路径。加速比按 `原生总耗时 / 对比路径总耗时` 计算。
 
-| 核心指标 | vLLM 原生 | 原 PR fused | 当前 fused | 当前 materialized |
+| 核心指标 | vLLM 原生 | 原 PR fused | 新 fused | materialized |
 | --- | ---: | ---: | ---: | ---: |
 | 最大绝对误差 | 0 | 5.921e-2 | 3.815e-6 | 3.815e-6 |
-| 平均绝对误差（15 点中的最大值） | 0 | 7.265e-3 | 4.5e-7 | 4.0e-7 |
+| 各测试点平均绝对误差的最大值 | 0 | 7.265e-3 | 4.5e-7 | 4.0e-7 |
 | 结果一致的测试点 | 15/15 | 0/15 | 15/15 | 15/15 |
 | Prompt 吞吐几何平均加速 | 1.000x | 1.012x | 1.022x | 1.037x |
 | TTFT 几何平均加速 | 1.000x | 1.009x | 1.025x | 1.043x |
@@ -80,8 +79,8 @@ Prompt Logprobs 流程现在直接接收 Hidden States 和目标 Token ID，绕�
 
 ## 测试范围
 
-这份结论只覆盖 Qwen3.5-27B、Batch 1、K≤20、TP2/4/8 和 H20。Batch 2/4、在线
-服务、其他模型形状和其他 GPU 尚未测试，不能直接套用这里的结果。
+目前只测了 Qwen3.5-27B、Batch 1、K≤20、TP2/4/8 和 H20。Batch 2/4、在线服务、
+其他模型和其他 GPU 不在这次测试范围内。
 
 原始数据在 `benchmark_artifacts/prompt-logprobs-adaptive-prompt-sweep-h20-20260825/`
 和 `benchmark_artifacts/prompt-logprobs-fourway-h20-k20-20260826/`。
